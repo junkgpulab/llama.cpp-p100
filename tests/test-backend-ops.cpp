@@ -10248,6 +10248,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // P100 quantized decoders at the model's shapes (Flash-Next on 2x P100, 2026-10-24)
+    for (int64_t n : {1, 2}) {
+        for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {
+            for (const auto & mk : std::initializer_list<std::array<int64_t, 2>>{{10240, 2560}, {2560, 6144}, {640, 2560}}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+            }
+        }
+        for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 10, false, 640, n, 2560));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 64, 10, false, 2560, n, 640));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 2560, n, 640, {1, 1}, {1, 1}));
+    }
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS}) {
+        // fused expert gate+up (SWIGLU), 10 of 64 experts; m = tokens, n = weight rows here
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
+            true, 64, 10, false, false, true, false, {1, 1}));
+    }
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
@@ -12954,6 +12973,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (const auto & mk : std::initializer_list<std::array<int64_t, 2>>{{640, 2560}, {2560, 640}}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 64, 10, false, mk[0], 1, mk[1]));
     }
+
+    // P100 quantized decoders: the model's decode shapes (compare GGML_CUDA_P100 unset vs 1)
+    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {
+        for (const auto & mk : std::initializer_list<std::array<int64_t, 2>>{{10240, 2560}, {2560, 6144}}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk[0], 1, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 248320, 1, 2560, {1, 1}, {1, 1}));
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS}) {
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 10, false, 640, 1, 2560));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
+            true, 128, 10, false, false, true, false, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 10, false, 2560, 1, 640));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

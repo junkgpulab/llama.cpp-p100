@@ -43,9 +43,31 @@ template <> struct p100_w<GGML_TYPE_BF16> {
     }
 };
 
+// Ported formats (one header each, 2026-10-24); each passed the exact decode check on the P100.
+#include "mmv-p100-q6_k.cuh"
+#include "mmv-p100-q5_k.cuh"
+#include "mmv-p100-q4_k.cuh"
+#include "mmv-p100-iq4_xs.cuh"
+#include "mmv-p100-iq4_nl.cuh"
+#include "mmv-p100-iq3_s.cuh"
+#include "mmv-p100-iq3_xxs.cuh"
+#include "mmv-p100-iq2_s.cuh"
+#include "mmv-p100-iq2_xs.cuh"
+#include "mmv-p100-iq2_xxs.cuh"
+
 // Single format registry, shared by the support check and the launch dispatch.
 #define GGML_CUDA_P100_TYPES(X) \
-    X(GGML_TYPE_BF16)
+    X(GGML_TYPE_BF16) \
+    X(GGML_TYPE_Q6_K) \
+    X(GGML_TYPE_Q5_K) \
+    X(GGML_TYPE_Q4_K) \
+    X(GGML_TYPE_IQ4_XS) \
+    X(GGML_TYPE_IQ4_NL) \
+    X(GGML_TYPE_IQ3_S) \
+    X(GGML_TYPE_IQ3_XXS) \
+    X(GGML_TYPE_IQ2_S) \
+    X(GGML_TYPE_IQ2_XS) \
+    X(GGML_TYPE_IQ2_XXS)
 
 static inline bool p100_supported(ggml_type type) {
     switch (type) {
