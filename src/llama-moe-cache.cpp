@@ -6,6 +6,9 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <map>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -227,6 +230,21 @@ struct llama_moe_cache::impl {
         size_t bytes  = 0;
     };
 
+    struct host_buffer {
+        void * data;
+        size_t size;
+        bool (*register_buffer)(void *, size_t);
+        void (*unregister_buffer)(void *);
+    };
+
+    struct copy_stats {
+        int64_t calls     = 0;
+        int64_t wait_us   = 0;
+        int64_t plan_us   = 0;
+        int64_t upload_us = 0;
+        stats experts;
+    };
+
     static constexpr int64_t max_batch = 32;
 
     int32_t n_expert_used;
@@ -234,6 +252,10 @@ struct llama_moe_cache::impl {
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
+
+    int64_t stats_interval = 0;
+    copy_stats stats_timing;
+    std::vector<host_buffer> registered_host_buffers;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -254,6 +276,15 @@ struct llama_moe_cache::impl {
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+        if (const char * env = std::getenv("LLAMA_MOE_CACHE_STATS")) {
+            char * end = nullptr;
+            errno = 0;
+            const auto interval = std::strtoll(env, &end, 10);
+            if (errno == 0 && end != env && *end == '\0' && interval > 0) {
+                stats_interval = interval;
+            }
+        }
+
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -474,8 +505,14 @@ struct llama_moe_cache::impl {
             if (d.host_bytes == 0) {
                 continue;
             }
-            LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts\n", __func__,
-                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0);
+            size_t n_cached_layers = 0;
+            for (const group & g : groups) {
+                if (g.id == (int32_t) id && g.n_slots > 0) {
+                    n_cached_layers += g.layers.size();
+                }
+            }
+            LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, %zu cached layers\n", __func__,
+                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, n_cached_layers);
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
@@ -483,6 +520,45 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+
+        if (!model.hparams.no_alloc) {
+            register_host_experts();
+        }
+    }
+
+    void register_host_experts() {
+        // CUDA registrations are portable across devices, so register each exact range only once.
+        std::map<std::pair<uintptr_t, size_t>, host_buffer> ranges;
+        for (const layer & l : layers) {
+            if (l.ig < 0) {
+                continue;
+            }
+            const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[groups[l.ig].id].backend));
+            const auto register_buffer = reg ? (bool (*)(void *, size_t))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;
+            const auto unregister_buffer = reg ? (void (*)(void *))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer") : nullptr;
+            for (const ggml_tensor * t : l.experts) {
+                const size_t size = ggml_nbytes(t);
+                ranges.emplace(std::make_pair((uintptr_t) t->data, size), host_buffer { t->data, size, register_buffer, unregister_buffer });
+            }
+        }
+
+        // Allocate bookkeeping before pinning so constructor allocation failures cannot leak registrations.
+        registered_host_buffers.reserve(ranges.size());
+        size_t pinned_bytes = 0;
+        size_t failed = 0;
+        for (const auto & entry : ranges) {
+            const host_buffer & buffer = entry.second;
+            if (buffer.register_buffer && buffer.unregister_buffer && buffer.register_buffer(buffer.data, buffer.size)) {
+                registered_host_buffers.push_back(buffer);
+                pinned_bytes += buffer.size;
+            } else {
+                failed++;
+            }
+        }
+        LLAMA_LOG_INFO("llama_moe_cache: host experts: %zu ranges registered, %.2f GiB pinned, %zu ranges failed\n",
+            registered_host_buffers.size(), pinned_bytes/1024.0/1024.0/1024.0, failed);
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -490,6 +566,9 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        for (const host_buffer & buffer : registered_host_buffers) {
+            buffer.unregister_buffer(buffer.data);
+        }
         log_stats();
     }
 
@@ -579,14 +658,17 @@ struct llama_moe_cache::impl {
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
+        const int64_t t_wait = stats_interval > 0 ? ggml_time_us() : 0;
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        const int64_t t_plan = stats_interval > 0 ? ggml_time_us() : 0;
 
         size_t n_hit = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
+        const int64_t t_upload = stats_interval > 0 ? ggml_time_us() : 0;
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
@@ -602,6 +684,26 @@ struct llama_moe_cache::impl {
                 ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
                 bytes += n*expert_size;
                 i += n;
+            }
+        }
+
+        if (stats_interval > 0) {
+            const int64_t t_upload_end = ggml_time_us();
+            stats_timing.calls++;
+            stats_timing.wait_us   += t_plan - t_wait;
+            stats_timing.plan_us   += t_upload - t_plan;
+            stats_timing.upload_us += t_upload_end - t_upload;
+            stats_timing.experts.hits   += n_hit;
+            stats_timing.experts.misses += fills.size();
+            stats_timing.experts.bytes  += bytes;
+            if (stats_timing.calls % stats_interval == 0) {
+                const double calls = (double) stats_timing.calls;
+                const stats & experts = stats_timing.experts;
+                const size_t n = experts.hits + experts.misses;
+                LLAMA_LOG_INFO("llama_moe_cache: calls = %lld, avg wait = %.2f us, avg plan = %.2f us, avg upload-issue = %.2f us, "
+                               "uploaded = %.2f MiB, hits = %zu, misses = %zu, hit rate = %.2f%%\n",
+                    (long long) stats_timing.calls, stats_timing.wait_us/calls, stats_timing.plan_us/calls, stats_timing.upload_us/calls,
+                    experts.bytes/1024.0/1024.0, experts.hits, experts.misses, n > 0 ? 100.0*experts.hits/n : 0.0);
             }
         }
 
