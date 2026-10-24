@@ -4,8 +4,13 @@
 // 0.5 hsub2 and 0.5 hfma2, with FP32 scale/min work amortized over eight weights
 // per lane. No FP32 weight decode. A row streams exactly 1760 B at k=2560;
 // coalesced 16-B loads, R-way activation reuse and native GP100 half2 arithmetic
-// should make the 437-MB output head memory-bound. This is an estimate; the
-// <=1150-us gate and actual register count require measurement on the P100.
+// should make the 437-MB output head memory-bound. Persistent blocks now convert
+// activations once and reuse them across row groups, with the grid capped by
+// cached SM count and occupancy. A second register tile prefetches all R rows of
+// the next Q5_K block before decoding the current one. Aligned 16-B shared loads
+// replace four scalar half2 loads to remove their 4-way bank conflicts. The
+// eleven weight-loading lanes and the decode math are unchanged. The <=1150-us
+// gate and actual register count still require measurement on the P100.
 
 // HIP/MUSA also glob this directory; only CUDA gets the new implementation.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -14,6 +19,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <map>
 #include <set>
 #include <tuple>
 
@@ -59,6 +65,11 @@ static __device__ __forceinline__ uint2 q5k_shuffle_pair(uint4 v, int source, bo
 }
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
+static __device__ __forceinline__ half2 q5k_half2_bits(uint32_t bits) {
+    return __halves2half2(__ushort_as_half(static_cast<unsigned short>(bits)),
+                         __ushort_as_half(static_cast<unsigned short>(bits >> 16)));
+}
+
 static __device__ __forceinline__ half2 q5k_half2(uint32_t low, uint32_t high, int selector, int group) {
     // Byte-permute two adjacent qs/qh bytes into the low bits of two halfwords.
     // qs stores groups 2*p and 2*p+1 in its low/high nibbles. qh[l] bit g
@@ -85,9 +96,8 @@ static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x / 32;
     constexpr int warps = q5k_threads / 32;
-    const int64_t first_row = (int64_t(blockIdx.x) * warps + warp) * R;
     const int groups = k / 32;
-    extern __shared__ float shared[];
+    extern __shared__ __align__(16) float shared[];
     half2 * input = reinterpret_cast<half2 *>(shared);
     float * sum_x = shared + k / 2;
     int * exponent = reinterpret_cast<int *>(sum_x + groups);
@@ -126,70 +136,124 @@ static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
     // Each half2 partial is reset before crossing a sub-block boundary.
     const int group = lane / 4;
     const int segment = lane & 3;
-    float acc[R] = {};
-    for (int ib = 0; ib < k / QK_K; ++ib) {
+    const int n_blocks = k / QK_K;
+    const int64_t n_groups = (int64_t(m) + warps * R - 1) / (warps * R);
+    for (int64_t row_group = blockIdx.x; row_group < n_groups; row_group += gridDim.x) {
+        const int64_t first_row = (row_group * warps + warp) * R;
+        float acc[R] = {};
         uint4 tile[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             tile[r] = make_uint4(0, 0, 0, 0);
-            if (first_row + r < m && lane < 11) {
-                // Lanes 0..10 stream consecutive 16-B chunks of the SAME row.
-                // Unroll R loads before consuming them: 2/4 independent loads
-                // per participating lane, including exactly one block header.
-                const char * p = weights + (first_row + r) * row_stride + size_t(ib) * sizeof(block_q5_K);
+            if (first_row + r < m && lane < 11 && n_blocks > 0) {
+                const char * p = weights + (first_row + r) * row_stride;
                 tile[r] = __ldg(reinterpret_cast<const uint4 *>(p) + lane);
             }
         }
-        const int g = 8 * ib + group;
-        const int input_pair = 128 * ib + 16 * group + 4 * segment;
-        const half2 a0 = input[input_pair + 0];
-        const half2 a1 = input[input_pair + 1];
-        const half2 a2 = input[input_pair + 2];
-        const half2 a3 = input[input_pair + 3];
-        const float rescale = __uint_as_float(uint32_t(127 + exponent[g]) << 23);
-        const float sx = segment == 0 ? sum_x[g] : 0.0f;
+        for (int ib = 0; ib < n_blocks; ++ib) {
+            // Fetch all R next-block vectors before consuming any current vector.
+            // The final iteration and padded rows keep zero tiles, with no loads.
+            uint4 next[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                next[r] = make_uint4(0, 0, 0, 0);
+                if (first_row + r < m && lane < 11 && ib + 1 < n_blocks) {
+                    // Lanes 0..10 stream consecutive 16-B chunks of the SAME row.
+                    const char * p = weights + (first_row + r) * row_stride + size_t(ib + 1) * sizeof(block_q5_K);
+                    next[r] = __ldg(reinterpret_cast<const uint4 *>(p) + lane);
+                }
+            }
+            const int g = 8 * ib + group;
+            const int input_pair = 128 * ib + 16 * group + 4 * segment;
+            // Every lane starts on a 16-B boundary. Force a single vector LDS so
+            // the compiler cannot split this into four bank-conflicting loads.
+            uint4 activation;
+            const uint32_t input_address = static_cast<uint32_t>(__cvta_generic_to_shared(input + input_pair));
+            asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(activation.x), "=r"(activation.y), "=r"(activation.z), "=r"(activation.w)
+                         : "r"(input_address) : "memory");
+            const half2 a0 = q5k_half2_bits(activation.x);
+            const half2 a1 = q5k_half2_bits(activation.y);
+            const half2 a2 = q5k_half2_bits(activation.z);
+            const half2 a3 = q5k_half2_bits(activation.w);
+            const float rescale = __uint_as_float(uint32_t(127 + exponent[g]) << 23);
+            const float sx = segment == 0 ? sum_x[g] : 0.0f;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                // Header and payload are shuffled from the registers that received
+                // the vectors; no per-weight byte loads, and no header rereads.
+                const uint32_t dm = __shfl_sync(q5k_mask, tile[r].x, 0);
+                const uint32_t s0 = __shfl_sync(q5k_mask, tile[r].y, 0);
+                const uint32_t s1 = __shfl_sync(q5k_mask, tile[r].z, 0);
+                const uint32_t s2 = __shfl_sync(q5k_mask, tile[r].w, 0);
+                const int shift = 8 * (group & 3);
+                const uint32_t b0 = (s0 >> shift) & 255;
+                const uint32_t b1 = (s1 >> shift) & 255;
+                const uint32_t b2 = (s2 >> shift) & 255;
+                // Exactly get_scale_min_k4: bytes 0..3, 4..7, 8..11 of scales.
+                const int sc = group < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4);
+                const int mn = group < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
+                const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dm)));
+                const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(dm >> 16)));
+                const uint2 lo = q5k_shuffle_pair(tile[r], 3 + (group & ~1) + segment / 2, segment & 1);
+                const uint2 hi = q5k_shuffle_pair(tile[r], 1 + segment / 2, segment & 1);
+                half2 partial = __float2half2_rn(0.0f);
+                partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4140, group), a0, partial);
+                partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4342, group), a1, partial);
+                partial = __hfma2(q5k_half2(lo.y, hi.y, 0x4140, group), a2, partial);
+                partial = __hfma2(q5k_half2(lo.y, hi.y, 0x4342, group), a3, partial);
+                const float2 p = __half22float2(partial);
+                const float dot = (p.x + p.y) * rescale;
+                acc[r] += (d * sc) * dot - (dmin * mn) * sx;
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                tile[r] = next[r];
+            }
+        }
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            // Header and payload are shuffled from the registers that received
-            // the vectors; no per-weight byte loads, and no header rereads.
-            const uint32_t dm = __shfl_sync(q5k_mask, tile[r].x, 0);
-            const uint32_t s0 = __shfl_sync(q5k_mask, tile[r].y, 0);
-            const uint32_t s1 = __shfl_sync(q5k_mask, tile[r].z, 0);
-            const uint32_t s2 = __shfl_sync(q5k_mask, tile[r].w, 0);
-            const int shift = 8 * (group & 3);
-            const uint32_t b0 = (s0 >> shift) & 255;
-            const uint32_t b1 = (s1 >> shift) & 255;
-            const uint32_t b2 = (s2 >> shift) & 255;
-            // Exactly get_scale_min_k4: bytes 0..3, 4..7, 8..11 of scales.
-            const int sc = group < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4);
-            const int mn = group < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
-            const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dm)));
-            const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(dm >> 16)));
-            const uint2 lo = q5k_shuffle_pair(tile[r], 3 + (group & ~1) + segment / 2, segment & 1);
-            const uint2 hi = q5k_shuffle_pair(tile[r], 1 + segment / 2, segment & 1);
-            half2 partial = __float2half2_rn(0.0f);
-            partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4140, group), a0, partial);
-            partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4342, group), a1, partial);
-            partial = __hfma2(q5k_half2(lo.y, hi.y, 0x4140, group), a2, partial);
-            partial = __hfma2(q5k_half2(lo.y, hi.y, 0x4342, group), a3, partial);
-            const float2 p = __half22float2(partial);
-            const float dot = (p.x + p.y) * rescale;
-            acc[r] += (d * sc) * dot - (dmin * mn) * sx;
-        }
-    }
 #pragma unroll
-    for (int r = 0; r < R; ++r) {
-#pragma unroll
-        for (int offset = 16; offset; offset >>= 1) {
-            acc[r] += __shfl_down_sync(q5k_mask, acc[r], offset);
-        }
-        if (lane == 0 && first_row + r < m) {
-            dst[first_row + r] = acc[r];
+            for (int offset = 16; offset; offset >>= 1) {
+                acc[r] += __shfl_down_sync(q5k_mask, acc[r], offset);
+            }
+            if (lane == 0 && first_row + r < m) {
+                dst[first_row + r] = acc[r];
+            }
         }
     }
 #else
     GGML_UNUSED_VARS(weights, x, dst, k, m, row_stride);
 #endif
+}
+
+static int q5k_persistent_blocks(int device, int rows, size_t shared_bytes) {
+    static std::mutex mutex;
+    static std::map<int, int> sm_counts;
+    static std::map<std::tuple<int, int, size_t>, int> block_counts;
+    const std::lock_guard<std::mutex> lock(mutex);
+    auto sm = sm_counts.find(device);
+    if (sm == sm_counts.end()) {
+        int count;
+        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+        sm = sm_counts.emplace(device, count).first;
+    }
+    // Occupancy also depends on k's dynamic shared allocation. Cache once per
+    // R and allocation size on each physical GPU, rather than reusing a count
+    // from an unrelated shape or device.
+    const auto key = std::make_tuple(device, rows, shared_bytes);
+    auto blocks = block_counts.find(key);
+    if (blocks == block_counts.end()) {
+        int count;
+        if (rows == 4) {
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&count, q5k_mmv<4>, q5k_threads, shared_bytes));
+        } else {
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&count, q5k_mmv<2>, q5k_threads, shared_bytes));
+        }
+        GGML_ASSERT(count > 0);
+        blocks = block_counts.emplace(key, count).first;
+    }
+    return sm->second * blocks->second;
 }
 
 } // namespace
@@ -214,7 +278,9 @@ bool ggml_cuda_p100_v2_q5k(
     }
     const int rows = q5k_rows_per_warp();
     const int64_t rows_per_block = (q5k_threads / 32) * rows;
-    const dim3 grid(static_cast<unsigned>((m + rows_per_block - 1) / rows_per_block));
+    const int64_t n_groups = (m + rows_per_block - 1) / rows_per_block;
+    const int max_blocks = q5k_persistent_blocks(ggml_cuda_info().devices[ctx.device].physical_device, rows, shared_bytes);
+    const dim3 grid(static_cast<unsigned>(n_groups < max_blocks ? n_groups : max_blocks));
     const char * weights = static_cast<const char *>(src0->data);
     const float * input = static_cast<const float *>(src1->data);
     float * output = static_cast<float *>(dst->data);
