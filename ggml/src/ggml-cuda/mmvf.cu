@@ -635,6 +635,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
+    if (ggml_cuda_p100_mmv(ctx, src0, src1, ids, dst, fusion)) return;
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 

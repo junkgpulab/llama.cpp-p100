@@ -10231,6 +10231,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    // P100 BF16 decode shapes; these also run against the CPU reference on other backends.
+    for (int64_t n : {1, 2, 4}) {
+        for (const auto & mk : std::initializer_list<std::array<int64_t, 2>>{{320, 10240}, {10240, 320}, {512, 2560}, {48, 2560}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+        for (const auto & mk : std::initializer_list<std::array<int64_t, 2>>{{640, 2560}, {2560, 640}}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 64, 10, false, mk[0], n, mk[1]));
+        }
+        for (ggml_glu_op op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+            for (bool bias : {false, true}) {
+                // This test's m argument is the token count and n is the number of weight rows.
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_BF16, op, n, 640, 2560,
+                    false, 1, 1, false, bias, true, false, {1, 1}));
+            }
+        }
+    }
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
@@ -12929,6 +12946,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Compare these with GGML_CUDA_P100 unset and set to 1 on sm_60.
+    for (const auto & mk : std::initializer_list<std::array<int64_t, 2>>{{320, 10240}, {10240, 320}, {512, 2560}, {48, 2560}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], 1, mk[1], {1, 1}, {1, 1}));
+    }
+    for (const auto & mk : std::initializer_list<std::array<int64_t, 2>>{{640, 2560}, {2560, 640}}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 64, 10, false, mk[0], 1, mk[1]));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

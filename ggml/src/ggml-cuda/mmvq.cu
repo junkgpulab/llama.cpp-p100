@@ -2004,6 +2004,7 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    if (ggml_cuda_p100_mmv(ctx, src0, src1, ids, dst, fusion)) return;
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
