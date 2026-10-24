@@ -6,9 +6,11 @@
 #include "mmv-p100-types.cuh"
 #include "unary.cuh"
 
+#include <array>
 #include <climits>
 #include <cstring>
 #include <set>
+#include <string>
 #include <tuple>
 #include <type_traits>
 
@@ -27,31 +29,84 @@ static bool p100_log_enabled() {
     return enabled;
 }
 
-static bool p100_decline(const char * reason) {
+static bool p100_decline(const char * reason, ggml_type type = GGML_TYPE_COUNT) {
     if (p100_log_enabled()) {
         static std::mutex mutex;
-        static std::set<std::string> seen;
+        static std::set<std::pair<std::string, ggml_type>> seen;
         const std::lock_guard<std::mutex> lock(mutex);
-        if (seen.emplace(reason).second) {
-            std::fprintf(stderr, "GGML_CUDA_P100 decline: %s\n", reason);
+        if (seen.emplace(reason, type).second) {
+            if (type == GGML_TYPE_COUNT) {
+                std::fprintf(stderr, "GGML_CUDA_P100 decline: %s\n", reason);
+            } else {
+                std::fprintf(stderr, "GGML_CUDA_P100 decline: %s type=%s\n", reason, ggml_type_name(type));
+            }
         }
     }
     return false;
 }
 
+static bool p100_format_enabled(ggml_type type) {
+    static const auto enabled = [] {
+        std::array<bool, GGML_TYPE_COUNT> formats{};
+        const char * env = std::getenv("GGML_CUDA_P100_FORMATS");
+        // Measured: all ten quantized formats were 2.5-6x slower; enable them only by explicit opt-in.
+        if (!env || std::strcmp(env, "default") == 0) {
+            formats[GGML_TYPE_BF16] = true;
+            return formats;
+        }
+        if (std::strcmp(env, "all") == 0) {
+            for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+                formats[i] = p100_supported(static_cast<ggml_type>(i));
+            }
+            return formats;
+        }
+        // Match ggml_type_name() exactly (including the capital K in q4_K).
+        // Empty/unknown tokens enable nothing; allow whitespace around list entries.
+        const std::string list(env);
+        size_t begin = 0;
+        while (begin < list.size()) {
+            const size_t comma = list.find(',', begin);
+            const size_t end = comma == std::string::npos ? list.size() : comma;
+            const std::string token = list.substr(begin, end - begin);
+            const size_t first = token.find_first_not_of(" \t\r\n\f\v");
+            if (first != std::string::npos) {
+                const size_t last = token.find_last_not_of(" \t\r\n\f\v");
+                const std::string name = token.substr(first, last - first + 1);
+                for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+                    const auto candidate = static_cast<ggml_type>(i);
+                    if (p100_supported(candidate) && name == ggml_type_name(candidate)) {
+                        formats[i] = true;
+                    }
+                }
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            begin = comma + 1;
+        }
+        return formats;
+    }();
+    const size_t index = static_cast<size_t>(type);
+    return index < enabled.size() && enabled[index];
+}
+
 static int p100_variant() {
+#if defined(GGML_CUDA_P100_ALL_VARIANTS)
     static const int variant = [] {
         const char * env = std::getenv("GGML_CUDA_P100_VARIANT");
+        if (env && std::strcmp(env, "0") == 0) {
+            return 0;
+        }
         if (env && std::strcmp(env, "1") == 0) {
             return 1;
         }
-        if (env && std::strcmp(env, "2") == 0) {
-            return 2;
-        }
-        // PROPOSED default: variant 0. Unset, "0", and invalid values use it.
-        return 0;
+        return 2; // Unset, "2", and invalid values use the measured default.
     }();
     return variant;
+#else
+    // Measured: variant 2 wins BF16 512x2560 (8.7 us vs MMVF's 10.5 us); ignore the env in this build.
+    return 2;
+#endif
 }
 
 static void p100_log_launch(
@@ -443,11 +498,11 @@ template <ggml_type type, int ncols, bool has_fusion, bool has_ids, int variant>
 static p100_geometry p100_launch_long(
         const p100_mmv_args & a, int64_t channels, int64_t samples_or_tokens, cudaStream_t stream) {
     using weight = p100_w<type>;
-    // All constants below are PROPOSED, pending P100 measurements.
+    // Measured: variant 2 wins BF16 512x2560; variants 0/1 are built only for explicit tuning builds.
     // BF16, n=1..3, >=1024 row instances (m * channels * samples/tokens):
-    // variant 0 (default): 64 lanes/row, 4 rows/256-thread block.
+    // variant 0:           64 lanes/row, 4 rows/256-thread block.
     // variant 1:          128 lanes/row, 2 rows/256-thread block.
-    // variant 2:           32 lanes/row, 8 rows/256-thread block.
+    // variant 2 (default): 32 lanes/row, 8 rows/256-thread block.
     // Below 1024 row instances use respectively 256/128/64 lanes, 2 rows/block,
     // spreading a thin matrix across more SMs while retaining several rows/block.
     // For n=4..8 halve lanes/row to limit accumulator register pressure.
@@ -481,7 +536,7 @@ static p100_geometry p100_launch_long(
 
 template <ggml_type type, int ncols, bool has_fusion, bool has_ids>
 static p100_geometry p100_launch(const p100_mmv_args & a, int64_t channels, int64_t samples_or_tokens, cudaStream_t stream) {
-    // Preserve both measured short-row geometries and the shared-input kernel.
+    // Measured: BF16 10240x320 improved from 66.4 to 19.3 us; preserve the short-row kernel/geometries.
     const auto launch = [&](auto row_threads, auto threads, auto tile) {
         constexpr int r = decltype(row_threads)::value;
         constexpr int b = decltype(threads)::value;
@@ -498,8 +553,10 @@ static p100_geometry p100_launch(const p100_mmv_args & a, int64_t channels, int6
         return launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 128>{}, std::integral_constant<int, 1024>{});
     } else {
         switch (p100_variant()) {
+#if defined(GGML_CUDA_P100_ALL_VARIANTS)
             case 0: return p100_launch_long<type, ncols, has_fusion, has_ids, 0>(a, channels, samples_or_tokens, stream);
             case 1: return p100_launch_long<type, ncols, has_fusion, has_ids, 1>(a, channels, samples_or_tokens, stream);
+#endif
             case 2: return p100_launch_long<type, ncols, has_fusion, has_ids, 2>(a, channels, samples_or_tokens, stream);
             default: GGML_ABORT("invalid cached P100 variant");
         }
@@ -591,6 +648,13 @@ bool ggml_cuda_p100_mmv(
     if (!p100_supported(src0->type)) {
         return p100_decline("no weight decoder");
     }
+    if (!p100_format_enabled(src0->type)) {
+        return p100_decline("format not enabled", src0->type);
+    }
+    // Measured: k>4096 lost at 320x10240 and was near MMVF at 4096x14336; retain the old path.
+    if (src0->type == GGML_TYPE_BF16 && src0->ne[0] > 4096) {
+        return p100_decline("BF16 long rows: old path is as fast");
+    }
     if (!p100_float_layout(src1) || !p100_float_layout(dst)) {
         return p100_decline("src1/dst must have contiguous aligned F32 rows");
     }
@@ -637,7 +701,7 @@ bool ggml_cuda_p100_mmv(
         return p100_decline("unsupported channel/sample broadcast");
     }
 
-    // PROPOSED conservative fallback for underfilled BF16 long-row launches.
+    // Measured in round 1: unbatched BF16 48x2560 lost to MMVF; retain the underfill fallback.
     // Even with only two rows/block, unbatched 48x2560 has just 24 blocks on
     // P100's 56 SMs; round 1 already lost to MMVF there. Keep the existing path.
     // Count expert/token and broadcast planes too, so otherwise useful batches
