@@ -14,7 +14,12 @@
 
 namespace {
 
-bool p100_log_enabled() {
+struct p100_geometry {
+    int threads_per_row;
+    int rows_per_block;
+};
+
+static bool p100_log_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_CUDA_P100_LOG");
         return env && std::strcmp(env, "1") == 0;
@@ -22,7 +27,7 @@ bool p100_log_enabled() {
     return enabled;
 }
 
-bool p100_decline(const char * reason) {
+static bool p100_decline(const char * reason) {
     if (p100_log_enabled()) {
         static std::mutex mutex;
         static std::set<std::string> seen;
@@ -34,7 +39,23 @@ bool p100_decline(const char * reason) {
     return false;
 }
 
-void p100_log_launch(ggml_type type, int64_t m, int64_t k, int64_t n, bool ids, bool fused) {
+static int p100_variant() {
+    static const int variant = [] {
+        const char * env = std::getenv("GGML_CUDA_P100_VARIANT");
+        if (env && std::strcmp(env, "1") == 0) {
+            return 1;
+        }
+        if (env && std::strcmp(env, "2") == 0) {
+            return 2;
+        }
+        // PROPOSED default: variant 0. Unset, "0", and invalid values use it.
+        return 0;
+    }();
+    return variant;
+}
+
+static void p100_log_launch(
+        ggml_type type, int64_t m, int64_t k, int64_t n, bool ids, bool fused, p100_geometry geometry) {
     if (!p100_log_enabled()) {
         return;
     }
@@ -43,8 +64,11 @@ void p100_log_launch(ggml_type type, int64_t m, int64_t k, int64_t n, bool ids, 
     static std::set<key> seen;
     const std::lock_guard<std::mutex> lock(mutex);
     if (seen.emplace(type, m, k, n, ids, fused).second) {
-        std::fprintf(stderr, "GGML_CUDA_P100 take: type=%s m=%lld k=%lld ncols=%lld ids=%d fused=%d\n",
-                     ggml_type_name(type), (long long) m, (long long) k, (long long) n, int(ids), int(fused));
+        // variant=-1 is the unchanged shared-input short-row kernel.
+        std::fprintf(stderr, "GGML_CUDA_P100 take: type=%s m=%lld k=%lld ncols=%lld ids=%d fused=%d "
+                            "variant=%d lanes/row=%d rows/block=%d\n",
+                     ggml_type_name(type), (long long) m, (long long) k, (long long) n, int(ids), int(fused),
+                     k > 1024 ? p100_variant() : -1, geometry.threads_per_row, geometry.rows_per_block);
     }
 }
 
@@ -222,13 +246,242 @@ static __global__ void p100_mmv(p100_mmv_args a) {
     }
 }
 
+// The long-row loop reads the FP32 input through the read-only cache. Each full,
+// aligned group is one 16-byte load; tensor views and the last 1..3 values use
+// scalar loads, without reading padding or changing the weight decoder contract.
+static __device__ __forceinline__ float4 p100_load_activation4(const char * column, int64_t first, int valid) {
+    if (valid <= 0) {
+        return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float * p = reinterpret_cast<const float *>(column + first * sizeof(float));
+    if (valid >= 4 && (reinterpret_cast<uintptr_t>(p) & 15) == 0) {
+        return __ldg(reinterpret_cast<const float4 *>(p));
+    }
+    return make_float4(__ldg(p), valid > 1 ? __ldg(p + 1) : 0.0f,
+                      valid > 2 ? __ldg(p + 2) : 0.0f, valid > 3 ? __ldg(p + 3) : 0.0f);
+}
+
+template <bool has_fusion, bool has_ids>
+static __device__ __forceinline__ void p100_store_long_result(
+        const p100_mmv_args & a, char * dst, int64_t row, int col, uint32_t channel, uint32_t sample,
+        int expert, float value, float gate_value) {
+    if constexpr (has_fusion) {
+        value += p100_bias_value<has_ids>(a.bias, row, col, channel, sample, expert);
+        if (a.gate) {
+            gate_value += p100_bias_value<has_ids>(a.gate_bias, row, col, channel, sample, expert);
+            switch (a.glu_op) {
+                case GGML_GLU_OP_SWIGLU:
+                    value *= ggml_cuda_op_silu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_GEGLU:
+                    value *= ggml_cuda_op_gelu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
+                    break;
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    value = ggml_cuda_op_swiglu_clamp_single(gate_value, value, a.glu_limit);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+    *reinterpret_cast<float *>(dst + col * a.dst_col + row * sizeof(float)) = value;
+    if constexpr (!has_fusion) {
+        GGML_UNUSED_VARS(channel, sample, expert, gate_value);
+    }
+}
+
+template <ggml_type type, int ncols, int threads_per_row, int rows_per_block, bool has_fusion, bool has_ids>
+static __global__ void p100_mmv_long(p100_mmv_args a) {
+    using weight = p100_w<type>;
+    constexpr int dw = weight::decode_weights;
+    constexpr int block_size = threads_per_row * rows_per_block;
+    constexpr int reduce_width = threads_per_row < WARP_SIZE ? threads_per_row : WARP_SIZE;
+    static_assert(dw > 0 && dw % 8 == 0 && 512 % dw == 0, "decoder chunks must divide 512");
+    static_assert(rows_per_block >= 2 && block_size % WARP_SIZE == 0 && block_size <= 512,
+                  "long-row blocks must contain multiple rows and complete warps");
+    const int tid = threadIdx.x;
+    const int lane = tid % threads_per_row;
+    const int row_in_block = tid / threads_per_row;
+    const int64_t row = int64_t(blockIdx.x) * rows_per_block + row_in_block;
+    const uint32_t channel = blockIdx.y;
+    const uint32_t sample = has_ids ? 0 : blockIdx.z;
+    const uint32_t token = has_ids ? blockIdx.z : 0;
+    const int expert = has_ids ? a.ids[channel + int64_t(token) * a.ids_stride]
+                              : fastdiv(channel, a.channel_ratio);
+    const uint32_t channel_y = has_ids ? fastmodulo(channel, a.channels_y) : channel;
+    const uint32_t sample_x = fastdiv(sample, a.sample_ratio);
+    const size_t x_offset = sample_x * a.x_sample + expert * a.x_channel + row * a.x_row;
+    const char * x = a.x + x_offset;
+    const char * gate = has_fusion && a.gate ? a.gate + x_offset : nullptr;
+    const char * y = a.y + sample * a.y_sample + channel_y * a.y_channel + token * a.y_col;
+    char * dst = a.dst + sample * a.dst_sample + channel * a.dst_channel + token * a.dst_col;
+    // Two independent FMA chains accompany the two independent decoded loads.
+    float sum0[ncols] = {};
+    float sum1[ncols] = {};
+    [[maybe_unused]] float gate_sum0[ncols] = {};
+    [[maybe_unused]] float gate_sum1[ncols] = {};
+
+    if (row < a.m) {
+        // No staging or barriers in this loop. Every weight is decoded once and
+        // reused across all ncols before advancing to the next pair of chunks
+        // (an explicit factor-two unroll of the weight-load loop).
+        for (int64_t first = int64_t(lane) * dw; first < a.k; first += 2 * threads_per_row * dw) {
+            const int64_t second = first + threads_per_row * dw;
+            const int valid0 = int(a.k - first < dw ? a.k - first : dw);
+            const int valid1 = second < a.k ? int(a.k - second < dw ? a.k - second : dw) : 0;
+            float w0[dw], w1[dw];
+            [[maybe_unused]] float g0[dw], g1[dw];
+            // Issue both independent weight loads before consuming either one.
+            weight::decode(x, first, valid0, w0);
+            if (valid1) {
+                weight::decode(x, second, valid1, w1);
+            }
+            if constexpr (has_fusion) {
+                if (gate) {
+                    weight::decode(gate, first, valid0, g0);
+                    if (valid1) {
+                        weight::decode(gate, second, valid1, g1);
+                    }
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                const char * column = y + j * a.y_col;
+#pragma unroll
+                for (int v = 0; v < dw; v += 4) {
+                    if (v < valid0) {
+                        const float4 y0 = p100_load_activation4(column, first + v, valid0 - v);
+                        sum0[j] = fmaf(w0[v + 0], y0.x, sum0[j]);
+                        sum0[j] = fmaf(w0[v + 1], y0.y, sum0[j]);
+                        sum0[j] = fmaf(w0[v + 2], y0.z, sum0[j]);
+                        sum0[j] = fmaf(w0[v + 3], y0.w, sum0[j]);
+                        if constexpr (has_fusion) {
+                            if (gate) {
+                                gate_sum0[j] = fmaf(g0[v + 0], y0.x, gate_sum0[j]);
+                                gate_sum0[j] = fmaf(g0[v + 1], y0.y, gate_sum0[j]);
+                                gate_sum0[j] = fmaf(g0[v + 2], y0.z, gate_sum0[j]);
+                                gate_sum0[j] = fmaf(g0[v + 3], y0.w, gate_sum0[j]);
+                            }
+                        }
+                    }
+                    if (v < valid1) {
+                        const float4 y1 = p100_load_activation4(column, second + v, valid1 - v);
+                        sum1[j] = fmaf(w1[v + 0], y1.x, sum1[j]);
+                        sum1[j] = fmaf(w1[v + 1], y1.y, sum1[j]);
+                        sum1[j] = fmaf(w1[v + 2], y1.z, sum1[j]);
+                        sum1[j] = fmaf(w1[v + 3], y1.w, sum1[j]);
+                        if constexpr (has_fusion) {
+                            if (gate) {
+                                gate_sum1[j] = fmaf(g1[v + 0], y1.x, gate_sum1[j]);
+                                gate_sum1[j] = fmaf(g1[v + 1], y1.y, gate_sum1[j]);
+                                gate_sum1[j] = fmaf(g1[v + 2], y1.z, gate_sum1[j]);
+                                gate_sum1[j] = fmaf(g1[v + 3], y1.w, gate_sum1[j]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        sum0[j] = warp_reduce_sum<reduce_width>(sum0[j] + sum1[j]);
+        if constexpr (has_fusion) {
+            if (gate) {
+                gate_sum0[j] = warp_reduce_sum<reduce_width>(gate_sum0[j] + gate_sum1[j]);
+            }
+        }
+    }
+    if constexpr (threads_per_row > WARP_SIZE) {
+        constexpr int warps = block_size / WARP_SIZE;
+        constexpr int warps_per_row = threads_per_row / WARP_SIZE;
+        __shared__ float partial[ncols * warps * (has_fusion ? 2 : 1)];
+        if (tid % WARP_SIZE == 0) {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                partial[j * warps + tid / WARP_SIZE] = sum0[j];
+                if constexpr (has_fusion) {
+                    partial[ncols * warps + j * warps + tid / WARP_SIZE] = gate_sum0[j];
+                }
+            }
+        }
+        // One final barrier for all columns, after the complete dot product.
+        // Incomplete row tiles participate too; no thread returns before it.
+        __syncthreads();
+        if (lane < WARP_SIZE) {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                const int index = j * warps + row_in_block * warps_per_row + lane;
+                const float value = warp_reduce_sum<WARP_SIZE>(lane < warps_per_row ? partial[index] : 0.0f);
+                float gate_value = 0.0f;
+                if constexpr (has_fusion) {
+                    if (gate) {
+                        gate_value = warp_reduce_sum<WARP_SIZE>(
+                            lane < warps_per_row ? partial[ncols * warps + index] : 0.0f);
+                    }
+                }
+                if (lane == 0 && row < a.m) {
+                    p100_store_long_result<has_fusion, has_ids>(
+                        a, dst, row, j, channel, sample, expert, value, gate_value);
+                }
+            }
+        }
+    } else if (row < a.m && lane == 0) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            p100_store_long_result<has_fusion, has_ids>(
+                a, dst, row, j, channel, sample, expert, sum0[j], gate_sum0[j]);
+        }
+    }
+}
+
+template <ggml_type type, int ncols, bool has_fusion, bool has_ids, int variant>
+static p100_geometry p100_launch_long(
+        const p100_mmv_args & a, int64_t channels, int64_t samples_or_tokens, cudaStream_t stream) {
+    using weight = p100_w<type>;
+    // All constants below are PROPOSED, pending P100 measurements.
+    // BF16, n=1..3, >=1024 row instances (m * channels * samples/tokens):
+    // variant 0 (default): 64 lanes/row, 4 rows/256-thread block.
+    // variant 1:          128 lanes/row, 2 rows/256-thread block.
+    // variant 2:           32 lanes/row, 8 rows/256-thread block.
+    // Below 1024 row instances use respectively 256/128/64 lanes, 2 rows/block,
+    // spreading a thin matrix across more SMs while retaining several rows/block.
+    // For n=4..8 halve lanes/row to limit accumulator register pressure.
+    // Compressed (<1 byte/weight) formats halve lanes again; larger decoder chunks
+    // reduce lanes in proportion to decode_weights/8 and target 128-thread blocks
+    // for decoder register pressure. All choices are powers of two.
+    constexpr bool compressed = weight::block_bytes < weight::block_size;
+    constexpr int target_threads = compressed || weight::decode_weights > 8 ? 128 : 256;
+    constexpr int pressure = (ncols >= 4 ? 2 : 1) * (compressed ? 2 : 1) *
+                             (weight::decode_weights / 8);
+    constexpr int regular_raw = (variant == 0 ? 64 : variant == 1 ? 128 : 32) / pressure;
+    constexpr int thin_raw = (variant == 0 ? 256 : variant == 1 ? 128 : 64) / pressure;
+    constexpr int regular = regular_raw < 8 ? 8 : regular_raw;
+    constexpr int thin = thin_raw < 8 ? 8 : thin_raw;
+    const auto launch = [&](auto row_threads, auto row_count) {
+        constexpr int r = decltype(row_threads)::value;
+        constexpr int rows = decltype(row_count)::value;
+        const dim3 grid(static_cast<unsigned int>((a.m + rows - 1) / rows),
+                        static_cast<unsigned int>(channels), static_cast<unsigned int>(samples_or_tokens));
+        p100_mmv_long<type, ncols, r, rows, has_fusion, has_ids>
+            <<<grid, r * rows, 0, stream>>>(a);
+        return p100_geometry{r, rows};
+    };
+    if (uint64_t(a.m) * uint64_t(channels) * uint64_t(samples_or_tokens) < 1024) {
+        constexpr int rows = thin < 64 ? 128 / thin : 2;
+        return launch(std::integral_constant<int, thin>{}, std::integral_constant<int, rows>{});
+    } else {
+        return launch(std::integral_constant<int, regular>{}, std::integral_constant<int, target_threads / regular>{});
+    }
+}
+
 template <ggml_type type, int ncols, bool has_fusion, bool has_ids>
-void p100_launch(const p100_mmv_args & a, int64_t channels, int64_t samples_or_tokens, cudaStream_t stream) {
-    // PROPOSED geometry, to be measured on P100:
-    // k<=512 (including k=320): 128 threads, 8 lanes/row, 16 rows/block (4 rows/warp).
-    // k<=1024: 128 threads, 16 lanes/row, 8 rows/block.
-    // k>1024 (including k=10240): 256 threads/row, 1 row/block, 2048-weight input tiles.
-    // For 5..8 columns use 128 threads/row and 1024-weight tiles, capping shared input at 32 KiB.
+static p100_geometry p100_launch(const p100_mmv_args & a, int64_t channels, int64_t samples_or_tokens, cudaStream_t stream) {
+    // Preserve both measured short-row geometries and the shared-input kernel.
     const auto launch = [&](auto row_threads, auto threads, auto tile) {
         constexpr int r = decltype(row_threads)::value;
         constexpr int b = decltype(threads)::value;
@@ -237,30 +490,33 @@ void p100_launch(const p100_mmv_args & a, int64_t channels, int64_t samples_or_t
                         static_cast<unsigned int>(channels), static_cast<unsigned int>(samples_or_tokens));
         p100_mmv<type, ncols, r, b, t, has_fusion, has_ids>
             <<<grid, b, ncols * t * sizeof(float), stream>>>(a);
+        return p100_geometry{r, b/r};
     };
     if (a.k <= 512) {
-        launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 128>{}, std::integral_constant<int, 512>{});
+        return launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 128>{}, std::integral_constant<int, 512>{});
     } else if (a.k <= 1024) {
-        launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 128>{}, std::integral_constant<int, 1024>{});
-    } else if constexpr (ncols <= 4) {
-        launch(std::integral_constant<int, 256>{}, std::integral_constant<int, 256>{}, std::integral_constant<int, 2048>{});
+        return launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 128>{}, std::integral_constant<int, 1024>{});
     } else {
-        launch(std::integral_constant<int, 128>{}, std::integral_constant<int, 128>{}, std::integral_constant<int, 1024>{});
+        switch (p100_variant()) {
+            case 0: return p100_launch_long<type, ncols, has_fusion, has_ids, 0>(a, channels, samples_or_tokens, stream);
+            case 1: return p100_launch_long<type, ncols, has_fusion, has_ids, 1>(a, channels, samples_or_tokens, stream);
+            case 2: return p100_launch_long<type, ncols, has_fusion, has_ids, 2>(a, channels, samples_or_tokens, stream);
+            default: GGML_ABORT("invalid cached P100 variant");
+        }
     }
 }
 
 template <ggml_type type, bool has_fusion>
-void p100_launch_columns(
+static p100_geometry p100_launch_columns(
         const p100_mmv_args & a, int ncols, int64_t channels, int64_t samples, cudaStream_t stream) {
     if (a.ids) {
         // Different tokens can select different experts, so each token has its own grid plane.
         // NVIDIA's existing unfused BF16 ID dispatcher bypasses MMVF; fused ID calls
         // can reach this hook. Routing and fusion eligibility are deliberately left to the caller.
-        p100_launch<type, 1, has_fusion, true>(a, channels, ncols, stream);
-        return;
+        return p100_launch<type, 1, has_fusion, true>(a, channels, ncols, stream);
     }
     switch (ncols) {
-#define P100_COLUMNS(N) case N: p100_launch<type, N, has_fusion, false>(a, channels, samples, stream); break;
+#define P100_COLUMNS(N) case N: return p100_launch<type, N, has_fusion, false>(a, channels, samples, stream);
         P100_COLUMNS(1)
         P100_COLUMNS(2)
         P100_COLUMNS(3)
@@ -274,7 +530,7 @@ void p100_launch_columns(
     }
 }
 
-bool p100_float_layout(const ggml_tensor * t) {
+static bool p100_float_layout(const ggml_tensor * t) {
     if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) ||
         reinterpret_cast<uintptr_t>(t->data) % alignof(float) != 0) {
         return false;
@@ -287,7 +543,7 @@ bool p100_float_layout(const ggml_tensor * t) {
     return true;
 }
 
-bool p100_set_bias(p100_bias & out, const ggml_tensor * bias, const ggml_tensor * dst,
+static bool p100_set_bias(p100_bias & out, const ggml_tensor * bias, const ggml_tensor * dst,
                    const ggml_tensor * src0, bool has_ids) {
     if (!bias) {
         return true;
@@ -381,6 +637,18 @@ bool ggml_cuda_p100_mmv(
         return p100_decline("unsupported channel/sample broadcast");
     }
 
+    // PROPOSED conservative fallback for underfilled BF16 long-row launches.
+    // Even with only two rows/block, unbatched 48x2560 has just 24 blocks on
+    // P100's 56 SMs; round 1 already lost to MMVF there. Keep the existing path.
+    // Count expert/token and broadcast planes too, so otherwise useful batches
+    // of small matrices are not rejected solely because m is small.
+    if (src0->type == GGML_TYPE_BF16 && k > 1024) {
+        const uint64_t two_row_blocks = uint64_t((m + 1) / 2) * uint64_t(channels) * uint64_t(samples_or_tokens);
+        if (two_row_blocks < uint64_t(ggml_cuda_info().devices[ctx.device].nsm)) {
+            return p100_decline("BF16 long rows: fewer than one two-row block per SM");
+        }
+    }
+
     p100_mmv_args a{};
     a.glu_op = GGML_GLU_OP_SWIGLU;
     if (fusion) {
@@ -426,18 +694,19 @@ bool ggml_cuda_p100_mmv(
     a.channels_y = ids ? init_fastdiv_values(src1->ne[1]) : make_uint3(0, 0, 0);
     const bool fused = a.gate || a.bias.data || a.gate_bias.data;
     const cudaStream_t stream = ctx.stream();
+    p100_geometry geometry{};
     switch (src0->type) {
 #define P100_DISPATCH(T) \
         case T: \
-            if (fused) { p100_launch_columns<T, true>(a, int(ncols), channels, dst->ne[3], stream); } \
-            else       { p100_launch_columns<T, false>(a, int(ncols), channels, dst->ne[3], stream); } \
+            if (fused) { geometry = p100_launch_columns<T, true>(a, int(ncols), channels, dst->ne[3], stream); } \
+            else       { geometry = p100_launch_columns<T, false>(a, int(ncols), channels, dst->ne[3], stream); } \
             break;
         GGML_CUDA_P100_TYPES(P100_DISPATCH)
 #undef P100_DISPATCH
         default: GGML_ABORT("missing P100 decoder dispatch");
     }
     CUDA_CHECK(cudaGetLastError());
-    p100_log_launch(src0->type, m, k, ncols, ids != nullptr, fused);
+    p100_log_launch(src0->type, m, k, ncols, ids != nullptr, fused, geometry);
     return true;
 }
 
