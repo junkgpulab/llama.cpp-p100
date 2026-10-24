@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -285,6 +286,32 @@ struct llama_moe_cache::impl {
             }
         }
 
+        std::vector<size_t> device_budgets;
+        std::string device_mib;
+        const char * device_env = std::getenv("LLAMA_MOE_CACHE_MIB_DEV");
+        if (device_env) {
+            const char * token = device_env;
+            while (true) {
+                char * end = nullptr;
+                errno = 0;
+                const auto mib = std::strtoll(token, &end, 10);
+                if (errno != 0 || end == token || (*end != ',' && *end != '\0') || mib < 0 ||
+                    (unsigned long long) mib > SIZE_MAX/1024/1024) {
+                    device_budgets.clear();
+                    break;
+                }
+                device_budgets.push_back((size_t) mib*1024*1024);
+                if (!device_mib.empty()) {
+                    device_mib += ',';
+                }
+                device_mib += std::to_string(mib);
+                if (*end == '\0') {
+                    break;
+                }
+                token = end + 1;
+            }
+        }
+
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -295,6 +322,14 @@ struct llama_moe_cache::impl {
         }
         if (devices.empty()) {
             throw std::runtime_error("MoE cache requires a GPU backend");
+        }
+        if (device_env) {
+            if (device_budgets.size() != devices.size()) {
+                LLAMA_LOG_WARN("%s: invalid LLAMA_MOE_CACHE_MIB_DEV (expected %zu nonnegative MiB values), ignoring override\n", __func__, devices.size());
+                device_budgets.clear();
+            } else {
+                LLAMA_LOG_INFO("%s: LLAMA_MOE_CACHE_MIB_DEV=%s MiB\n", __func__, device_mib.c_str());
+            }
         }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
@@ -378,7 +413,9 @@ struct llama_moe_cache::impl {
         for (group & g : groups) {
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
-            const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
+            const size_t  budget    = device_budgets.empty()
+                ? (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes)
+                : (size_t) ((double) device_budgets[g.id]*g.host_bytes/d.host_bytes);
             const int32_t max_slots = g.layers.size()*n_expert;
             while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
                 g.n_slots++;
