@@ -1,0 +1,239 @@
+#include "mmv-p100-v2-q5k.cuh"
+
+// Expected inner work per weight: about 6-9 integer/shuffle instructions plus
+// 0.5 hsub2 and 0.5 hfma2, with FP32 scale/min work amortized over eight weights
+// per lane. No FP32 weight decode. A row streams exactly 1760 B at k=2560;
+// coalesced 16-B loads, R-way activation reuse and native GP100 half2 arithmetic
+// should make the 437-MB output head memory-bound. This is an estimate; the
+// <=1150-us gate and actual register count require measurement on the P100.
+
+// HIP/MUSA also glob this directory; only CUDA gets the new implementation.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+#include <climits>
+#include <cmath>
+#include <cstddef>
+#include <cstring>
+#include <set>
+#include <tuple>
+
+namespace {
+
+constexpr int q5k_threads = 128;
+constexpr unsigned q5k_mask = 0xffffffffu;
+static_assert(sizeof(block_q5_K) == 11 * sizeof(uint4), "Q5_K must be eleven aligned vectors");
+static_assert(offsetof(block_q5_K, scales) == 4 && offsetof(block_q5_K, qh) == 16 &&
+              offsetof(block_q5_K, qs) == 48, "Q5_K header/qh/qs layout changed");
+
+static int q5k_rows_per_warp() {
+    static const int rows = [] {
+        const char * env = std::getenv("GGML_CUDA_P100_V2_R");
+        return env && std::strcmp(env, "4") == 0 ? 4 : 2;
+    }();
+    return rows;
+}
+
+static void q5k_log_launch(int64_t m, int64_t k, int rows) {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_CUDA_P100_LOG");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    if (enabled) {
+        static std::mutex mutex;
+        static std::set<std::tuple<int64_t, int64_t, int>> seen;
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (seen.emplace(m, k, rows).second) {
+            std::fprintf(stderr, "p100 v2 q5_k m=%lld k=%lld R=%d\n", (long long) m, (long long) k, rows);
+        }
+    }
+}
+
+// Keep every shuffle converged: the selector belongs to the receiving lane,
+// so selecting a vector component before the shuffle would read the wrong word.
+static __device__ __forceinline__ uint2 q5k_shuffle_pair(uint4 v, int source, bool upper) {
+    const uint32_t x = __shfl_sync(q5k_mask, v.x, source);
+    const uint32_t y = __shfl_sync(q5k_mask, v.y, source);
+    const uint32_t z = __shfl_sync(q5k_mask, v.z, source);
+    const uint32_t w = __shfl_sync(q5k_mask, v.w, source);
+    return make_uint2(upper ? z : x, upper ? w : y);
+}
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
+static __device__ __forceinline__ half2 q5k_half2(uint32_t low, uint32_t high, int selector, int group) {
+    // Byte-permute two adjacent qs/qh bytes into the low bits of two halfwords.
+    // qs stores groups 2*p and 2*p+1 in its low/high nibbles. qh[l] bit g
+    // belongs to weight 32*g+l (not to byte g/2). Merge it into bit 4 FIRST.
+    const uint32_t q4 = __byte_perm(low >> (4 * (group & 1)), 0, selector) & 0x000f000fu;
+    const uint32_t qh = (__byte_perm(high, 0, selector) >> group) & 0x00010001u;
+    const uint32_t q5 = q4 | (qh << 4);
+    uint32_t magic;
+    // (q5 & 0x001f001f) | 0x64006400: each half is exactly 1024 + q5.
+    asm("lop3.b32 %0, %1, 0x001f001f, 0x64006400, 0xea;" : "=r"(magic) : "r"(q5));
+    const half2 value = __halves2half2(__ushort_as_half(static_cast<unsigned short>(magic)),
+                                    __ushort_as_half(static_cast<unsigned short>(magic >> 16)));
+    return __hsub2(value, __float2half2_rn(1024.0f));
+}
+#endif
+
+template <int R>
+static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
+        const char * __restrict__ weights, const float * __restrict__ x, float * __restrict__ dst,
+        int k, int m, size_t row_stride) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
+    // 8 resident blocks * 128 threads targets <=64 registers/thread on GP100.
+    // The sm_50 pass used by multi-arch builds has an empty, never-launched body.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x / 32;
+    constexpr int warps = q5k_threads / 32;
+    const int64_t first_row = (int64_t(blockIdx.x) * warps + warp) * R;
+    const int groups = k / 32;
+    extern __shared__ float shared[];
+    half2 * input = reinterpret_cast<half2 *>(shared);
+    float * sum_x = shared + k / 2;
+    int * exponent = reinterpret_cast<int *>(sum_x + groups);
+
+    // Each block reads and converts the input exactly once, and keeps the sums
+    // in the original FP32 domain for the minimum term.
+    for (int g = warp; g < groups; g += warps) {
+        const float value = x[32 * g + lane];
+        float maximum = fabsf(value);
+#pragma unroll
+        for (int offset = 16; offset; offset >>= 1) {
+            maximum = fmaxf(maximum, __shfl_xor_sync(q5k_mask, maximum, offset));
+        }
+        const int e = max(0, int((__float_as_uint(maximum) >> 23) & 255) - 127 - 5);
+        // Finite scaled |x| <64 (or <=64 after half rounding). Even a full
+        // 32-weight half2 partial has at most 16 terms/component, hence
+        // |partial| <=16*31*64=31744: conversion AND accumulation cannot overflow.
+        // No clamping of ordinary activations, and undo 2^-e only in FP32.
+        // e is in [0,122] for finite FP32 input, so both powers of two are
+        // normal FP32 values; constructing them avoids a libdevice ldexp call.
+        const float prescale = __uint_as_float(uint32_t(127 - e) << 23);
+        reinterpret_cast<half *>(input)[32 * g + lane] = __float2half_rn(value * prescale);
+        float sum = value;
+#pragma unroll
+        for (int offset = 16; offset; offset >>= 1) {
+            sum += __shfl_down_sync(q5k_mask, sum, offset);
+        }
+        if (lane == 0) {
+            sum_x[g] = sum;
+            exponent[g] = e;
+        }
+    }
+    __syncthreads();
+
+    // Four lanes cover one 32-weight sub-block, eight adjacent weights each.
+    // Each half2 partial is reset before crossing a sub-block boundary.
+    const int group = lane / 4;
+    const int segment = lane & 3;
+    float acc[R] = {};
+    for (int ib = 0; ib < k / QK_K; ++ib) {
+        uint4 tile[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            tile[r] = make_uint4(0, 0, 0, 0);
+            if (first_row + r < m && lane < 11) {
+                // Lanes 0..10 stream consecutive 16-B chunks of the SAME row.
+                // Unroll R loads before consuming them: 2/4 independent loads
+                // per participating lane, including exactly one block header.
+                const char * p = weights + (first_row + r) * row_stride + size_t(ib) * sizeof(block_q5_K);
+                tile[r] = __ldg(reinterpret_cast<const uint4 *>(p) + lane);
+            }
+        }
+        const int g = 8 * ib + group;
+        const int input_pair = 128 * ib + 16 * group + 4 * segment;
+        const half2 a0 = input[input_pair + 0];
+        const half2 a1 = input[input_pair + 1];
+        const half2 a2 = input[input_pair + 2];
+        const half2 a3 = input[input_pair + 3];
+        const float rescale = __uint_as_float(uint32_t(127 + exponent[g]) << 23);
+        const float sx = segment == 0 ? sum_x[g] : 0.0f;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            // Header and payload are shuffled from the registers that received
+            // the vectors; no per-weight byte loads, and no header rereads.
+            const uint32_t dm = __shfl_sync(q5k_mask, tile[r].x, 0);
+            const uint32_t s0 = __shfl_sync(q5k_mask, tile[r].y, 0);
+            const uint32_t s1 = __shfl_sync(q5k_mask, tile[r].z, 0);
+            const uint32_t s2 = __shfl_sync(q5k_mask, tile[r].w, 0);
+            const int shift = 8 * (group & 3);
+            const uint32_t b0 = (s0 >> shift) & 255;
+            const uint32_t b1 = (s1 >> shift) & 255;
+            const uint32_t b2 = (s2 >> shift) & 255;
+            // Exactly get_scale_min_k4: bytes 0..3, 4..7, 8..11 of scales.
+            const int sc = group < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4);
+            const int mn = group < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
+            const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dm)));
+            const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(dm >> 16)));
+            const uint2 lo = q5k_shuffle_pair(tile[r], 3 + (group & ~1) + segment / 2, segment & 1);
+            const uint2 hi = q5k_shuffle_pair(tile[r], 1 + segment / 2, segment & 1);
+            half2 partial = __float2half2_rn(0.0f);
+            partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4140, group), a0, partial);
+            partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4342, group), a1, partial);
+            partial = __hfma2(q5k_half2(lo.y, hi.y, 0x4140, group), a2, partial);
+            partial = __hfma2(q5k_half2(lo.y, hi.y, 0x4342, group), a3, partial);
+            const float2 p = __half22float2(partial);
+            const float dot = (p.x + p.y) * rescale;
+            acc[r] += (d * sc) * dot - (dmin * mn) * sx;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int offset = 16; offset; offset >>= 1) {
+            acc[r] += __shfl_down_sync(q5k_mask, acc[r], offset);
+        }
+        if (lane == 0 && first_row + r < m) {
+            dst[first_row + r] = acc[r];
+        }
+    }
+#else
+    GGML_UNUSED_VARS(weights, x, dst, k, m, row_stride);
+#endif
+}
+
+} // namespace
+
+bool ggml_cuda_p100_v2_q5k(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int64_t k = src0->ne[0];
+    const int64_t m = src0->ne[1];
+    // The caller checks type, 2-D, single-column and contiguous F32 eligibility.
+    // Restrict shared memory to the portable Pascal 48-KiB per-block limit.
+    if (k <= 0 || k > INT_MAX || k % QK_K != 0 || m <= 0 || m > INT_MAX ||
+        src1->ne[0] != k || dst->ne[0] != m || src0->nb[0] != sizeof(block_q5_K) ||
+        reinterpret_cast<uintptr_t>(src0->data) % 16 != 0 || src0->nb[1] % 16 != 0 ||
+        src0->nb[1] < size_t(k / QK_K) * sizeof(block_q5_K) ||
+        reinterpret_cast<uintptr_t>(src1->data) % alignof(float) != 0 ||
+        reinterpret_cast<uintptr_t>(dst->data) % alignof(float) != 0) {
+        return false;
+    }
+    const size_t shared_bytes = size_t(k) * sizeof(half) + size_t(k / 32) * (sizeof(float) + sizeof(int));
+    if (shared_bytes > 48 * 1024) {
+        return false;
+    }
+    const int rows = q5k_rows_per_warp();
+    const int64_t rows_per_block = (q5k_threads / 32) * rows;
+    const dim3 grid(static_cast<unsigned>((m + rows_per_block - 1) / rows_per_block));
+    const char * weights = static_cast<const char *>(src0->data);
+    const float * input = static_cast<const float *>(src1->data);
+    float * output = static_cast<float *>(dst->data);
+    if (rows == 4) {
+        q5k_mmv<4><<<grid, q5k_threads, shared_bytes, ctx.stream()>>>(weights, input, output, int(k), int(m), src0->nb[1]);
+    } else {
+        q5k_mmv<2><<<grid, q5k_threads, shared_bytes, ctx.stream()>>>(weights, input, output, int(k), int(m), src0->nb[1]);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    q5k_log_launch(m, k, rows);
+    return true;
+}
+
+#else
+
+bool ggml_cuda_p100_v2_q5k(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+    return false;
+}
+
+#endif
