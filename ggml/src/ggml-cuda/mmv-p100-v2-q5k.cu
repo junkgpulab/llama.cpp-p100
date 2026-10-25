@@ -171,7 +171,7 @@ static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 3 : 6)) void q5k_mmv(
     const uint32_t rot_b = uint32_t(group + 8 - qpos) & 31u;
     const int qs_off = 48 + 32 * (group >> 1) + 16 * half_sel;
     const int qh_off = 16 + 16 * half_sel;
-    const int shift = 8 * (group & 3);
+    const int sel = 0x4440 + (group & 3);
     const int64_t n_groups = (int64_t(m) + warps * R - 1) / (warps * R);
     for (int64_t row_group = blockIdx.x; row_group < n_groups; row_group += gridDim.x) {
         const int64_t first_row = (row_group * warps + warp) * R;
@@ -225,9 +225,9 @@ static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 3 : 6)) void q5k_mmv(
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const uint32_t dm = th[r].x;
-                const uint32_t b0 = (th[r].y >> shift) & 255;
-                const uint32_t b1 = (th[r].z >> shift) & 255;
-                const uint32_t b2 = (th[r].w >> shift) & 255;
+                const uint32_t b0 = __byte_perm(th[r].y, 0, sel);
+                const uint32_t b1 = __byte_perm(th[r].z, 0, sel);
+                const uint32_t b2 = __byte_perm(th[r].w, 0, sel);
                 const int sc = group < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4);
                 const int mn = group < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
                 const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dm)));
