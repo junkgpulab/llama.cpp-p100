@@ -141,27 +141,34 @@ static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
     for (int64_t row_group = blockIdx.x; row_group < n_groups; row_group += gridDim.x) {
         const int64_t first_row = (row_group * warps + warp) * R;
         float acc[R] = {};
-        uint4 tile[R];
+        // Every lane loads its own qs/qh bytes (8 B each) plus the 16-B header
+        // (broadcast), so no shuffles are needed. Rows are clamped, not masked.
+        const char * rowp[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            tile[r] = make_uint4(0, 0, 0, 0);
-            if (first_row + r < m && lane < 11 && n_blocks > 0) {
-                const char * p = weights + (first_row + r) * row_stride;
-                tile[r] = __ldg(reinterpret_cast<const uint4 *>(p) + lane);
-            }
+            const int64_t row = first_row + r < m ? first_row + r : m - 1;
+            rowp[r] = weights + row * row_stride;
+        }
+        const int qs_off = 48 + 32 * (group >> 1) + 8 * segment;
+        const int qh_off = 16 + 8 * segment;
+        uint4 th[R]; uint2 tl[R]; uint2 tq[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            th[r] = __ldg(reinterpret_cast<const uint4 *>(rowp[r]));
+            tl[r] = __ldg(reinterpret_cast<const uint2 *>(rowp[r] + qs_off));
+            tq[r] = __ldg(reinterpret_cast<const uint2 *>(rowp[r] + qh_off));
         }
         for (int ib = 0; ib < n_blocks; ++ib) {
             // Fetch all R next-block vectors before consuming any current vector.
             // The final iteration and padded rows keep zero tiles, with no loads.
-            uint4 next[R];
+            uint4 nh[R]; uint2 nl[R]; uint2 nq[R];
+            const int nb = ib + 1 < n_blocks ? ib + 1 : ib;
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                next[r] = make_uint4(0, 0, 0, 0);
-                if (first_row + r < m && lane < 11 && ib + 1 < n_blocks) {
-                    // Lanes 0..10 stream consecutive 16-B chunks of the SAME row.
-                    const char * p = weights + (first_row + r) * row_stride + size_t(ib + 1) * sizeof(block_q5_K);
-                    next[r] = __ldg(reinterpret_cast<const uint4 *>(p) + lane);
-                }
+                const char * p = rowp[r] + size_t(nb) * sizeof(block_q5_K);
+                nh[r] = __ldg(reinterpret_cast<const uint4 *>(p));
+                nl[r] = __ldg(reinterpret_cast<const uint2 *>(p + qs_off));
+                nq[r] = __ldg(reinterpret_cast<const uint2 *>(p + qh_off));
             }
             const int g = 8 * ib + group;
             const int input_pair = 128 * ib + 16 * group + 4 * segment;
@@ -182,10 +189,10 @@ static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
             for (int r = 0; r < R; ++r) {
                 // Header and payload are shuffled from the registers that received
                 // the vectors; no per-weight byte loads, and no header rereads.
-                const uint32_t dm = __shfl_sync(q5k_mask, tile[r].x, 0);
-                const uint32_t s0 = __shfl_sync(q5k_mask, tile[r].y, 0);
-                const uint32_t s1 = __shfl_sync(q5k_mask, tile[r].z, 0);
-                const uint32_t s2 = __shfl_sync(q5k_mask, tile[r].w, 0);
+                const uint32_t dm = th[r].x;
+                const uint32_t s0 = th[r].y;
+                const uint32_t s1 = th[r].z;
+                const uint32_t s2 = th[r].w;
                 const int shift = 8 * (group & 3);
                 const uint32_t b0 = (s0 >> shift) & 255;
                 const uint32_t b1 = (s1 >> shift) & 255;
@@ -195,8 +202,8 @@ static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
                 const int mn = group < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
                 const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dm)));
                 const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(dm >> 16)));
-                const uint2 lo = q5k_shuffle_pair(tile[r], 3 + (group & ~1) + segment / 2, segment & 1);
-                const uint2 hi = q5k_shuffle_pair(tile[r], 1 + segment / 2, segment & 1);
+                const uint2 lo = tl[r];
+                const uint2 hi = tq[r];
                 half2 partial = __float2half2_rn(0.0f);
                 partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4140, group), a0, partial);
                 partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4342, group), a1, partial);
@@ -208,7 +215,7 @@ static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
             }
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                tile[r] = next[r];
+                th[r] = nh[r]; tl[r] = nl[r]; tq[r] = nq[r];
             }
         }
 #pragma unroll
