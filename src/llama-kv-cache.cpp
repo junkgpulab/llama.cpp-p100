@@ -1,5 +1,10 @@
 #include "llama-kv-cache.h"
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+#include <type_traits>
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1567,6 +1572,8 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    bool single_seq; // the cache holds one sequence, so every non-empty cell belongs to it
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1642,6 +1649,75 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
                     seq_srct[seq_id] = i;
+                }
+            }
+
+            // one sequence, no SWA or ALiBi: a cell is kept iff it is used and, for a causal mask, not
+            // in the future. Vectorizable, and it reads 4 bytes per cell instead of the 32-byte
+            // sequence set, which at 262144 cells takes the first row of a mask from ~1.5 ms to a
+            // fraction of that. With M-RoPE only the cells at the token's own position can differ
+            // from the 1-D rule; they are rechecked with the 2-D test below.
+            if constexpr (!swa && !alibi) {
+                static const bool fast = [] { const char * e = getenv("LLAMA_KQ_MASK_FAST"); return !e || atoi(e) != 0; }();
+                if (fast && !prev && args.single_seq) {
+                    const llama_pos * cpos = cells.pos_data();
+                    T * row = data + idst;
+                    // one pass: the mask row, and a flag per 64 cells for "may hold a cell the other
+                    // tokens of this sequence could flip" (pos >= thr, see below), so the second
+                    // pass only visits those few blocks instead of rereading every position
+                    const llama_pos thr = seq_pos_min[seq_id] - (int32_t) (n_swa + 32);
+                    for (int64_t j0 = 0; j0 < n_kv; j0 += 64) {
+                        const int64_t j1 = std::min<int64_t>(n_kv, j0 + 64);
+                        bool near = false; // this block may hold a cell with pos >= thr
+#if defined(__SSE2__)
+                        if constexpr (std::is_same_v<T, ggml_fp16_t>) {
+                            if (j1 - j0 == 64) {
+                                // 8 cells per step: keep iff 0 <= pos (<= p1 when causal); f16 0 or -inf
+                                const __m128i lo  = _mm_set1_epi32(-1);
+                                const __m128i hi  = _mm_set1_epi32(causal ? p1 + 1 : INT32_MAX);
+                                const __m128i th  = _mm_set1_epi32(std::max<llama_pos>(thr, 0) - 1);
+                                const __m128i ninf = _mm_set1_epi16((short) 0xFC00);
+                                __m128i any = _mm_setzero_si128();
+                                for (int64_t j = j0; j < j1; j += 8) {
+                                    const __m128i c0 = _mm_loadu_si128((const __m128i *) (cpos + j));
+                                    const __m128i c1 = _mm_loadu_si128((const __m128i *) (cpos + j + 4));
+                                    const __m128i k0 = _mm_and_si128(_mm_cmpgt_epi32(c0, lo), _mm_cmplt_epi32(c0, hi));
+                                    const __m128i k1 = _mm_and_si128(_mm_cmpgt_epi32(c1, lo), _mm_cmplt_epi32(c1, hi));
+                                    const __m128i k  = _mm_packs_epi32(k0, k1); // 0xFFFF where kept
+                                    _mm_storeu_si128((__m128i *) (row + j), _mm_andnot_si128(k, ninf));
+                                    any = _mm_or_si128(any, _mm_or_si128(_mm_cmpgt_epi32(c0, th), _mm_cmpgt_epi32(c1, th)));
+                                }
+                                near = _mm_movemask_epi8(any) != 0;
+                                goto near_cells;
+                            }
+                        }
+#endif
+                        {
+                            llama_pos bm = -1;
+                            for (int64_t j = j0; j < j1; ++j) {
+                                const llama_pos c = cpos[j];
+                                row[j] = (c >= 0 && (!causal || c <= p1)) ? mask_keep : mask_drop;
+                                bm = std::max(bm, c);
+                            }
+                            near = bm >= thr && bm >= 0;
+                        }
+#if defined(__SSE2__)
+near_cells:
+#endif
+                        if (near) {
+                            for (int64_t j = j0; j < j1; ++j) {
+                                if (cpos[j] >= thr && cpos[j] >= 0) {
+                                    idxs.push_back((uint32_t) j);
+                                    if constexpr (causal && is_2d) {
+                                        if (cpos[j] == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                                            row[j] = mask_drop;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
                 }
             }
 
@@ -1778,7 +1854,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
     }
 
-    //const int64_t t_start = ggml_time_us();
+    static const bool tl_mask = getenv("LLAMA_TL_MASK") != nullptr; // TEMP timing
+    const int64_t t_start = tl_mask ? ggml_time_us() : 0;
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1790,6 +1867,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.single_seq       =*/ n_seq_max == 1,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -1798,9 +1876,82 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
+    if (tl_mask) { fprintf(stderr, "TL_MASK n_kv %lld n_tokens %u : %lld us\n", (long long) n_kv, n_tokens, (long long) (ggml_time_us() - t_start)); }
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+bool llama_kv_cache::kq_mask_compact_static() const {
+    static const bool on = [] { const char * e = getenv("LLAMA_KQ_MASK_COMPACT"); return !e || atoi(e) != 0; }();
+    return on && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && v_cells.size() == 1;
+}
+
+bool llama_kv_cache::kq_mask_prefix(const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn, int32_t * L) const {
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+    if (!kq_mask_compact_static() || !causal_attn || ubatch->n_tokens == 0) {
+        return false;
+    }
+    const auto & cells = v_cells[0];
+    if (n_kv > cells.size()) {
+        return false;
+    }
+    const llama_pos * cpos = cells.pos_data();
+    const bool is_2d = ubatch->is_pos_2d();
+
+    // The mask keeps cell j for token (p, x, y) iff pos_j >= 0 && pos_j <= p, and with M-RoPE not
+    // (pos_j == p && (y_j, x_j) > (y, x)) (set_input_kq_mask_impl). If the used cells come first, in
+    // non-decreasing position and, within one position, strictly increasing (y, x), every kept set
+    // is a prefix of the cells.
+    uint32_t n_used = 0;
+    while (n_used < n_kv && cpos[n_used] >= 0) {
+        if (n_used > 0 && cpos[n_used] < cpos[n_used - 1]) {
+            return false;
+        }
+        if (n_used > 0 && is_2d && cpos[n_used] == cpos[n_used - 1]) {
+            const auto & a = cells.ext_get(n_used - 1);
+            if (!cells.ext_get(n_used).is_2d_gt(a.x, a.y)) {
+                return false;
+            }
+        }
+        n_used++;
+    }
+    for (uint32_t j = n_used; j < n_kv; ++j) {
+        if (cpos[j] >= 0) {
+            return false;
+        }
+    }
+
+    const uint32_t n_tokens = ubatch->n_tokens;
+    int64_t L0 = 0;
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        if (ubatch->n_seq_id[t] != 1) {
+            return false;
+        }
+        const llama_pos p  = ubatch->pos[t];
+        const llama_pos * lo = std::lower_bound(cpos, cpos + n_used, p);
+        const llama_pos * hi = std::upper_bound(cpos, cpos + n_used, p);
+        int64_t Lt = hi - cpos;
+        if (is_2d && hi > lo) {
+            const llama_pos py = ubatch->pos[t + n_tokens];
+            const llama_pos px = ubatch->pos[t + n_tokens*2];
+            Lt = lo - cpos;
+            while (cpos + Lt < hi && !cells.ext_get((uint32_t) Lt).is_2d_gt(px, py)) {
+                Lt++;
+            }
+        }
+        if (t == 0) {
+            L0 = Lt;
+        } else if (Lt != L0 + t) {
+            return false;
+        }
+        if (L != nullptr) {
+            L[t] = (int32_t) Lt;
+        }
+    }
+    return true;
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2818,6 +2969,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+    reserve = true;
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2943,7 +3095,50 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (dst->type == GGML_TYPE_I32) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        GGML_ASSERT(dst->ne[0] == (int64_t) ubatch->n_tokens);
+        if (!kv->kq_mask_prefix(ubatch, n_kv, causal_attn, (int32_t *) dst->data)) {
+            GGML_ABORT("compact KQ mask chosen at graph build no longer holds");
+        }
+        static const bool dbg = getenv("LLAMA_KQ_MASK_DEBUG") != nullptr;
+        if (dbg) {
+            // compare with the full mask the normal path would have written
+            ggml_tensor tmp = *dst;
+            std::vector<ggml_fp16_t> full((size_t) n_kv*ubatch->n_tokens);
+            tmp.type = GGML_TYPE_F16; tmp.ne[0] = n_kv; tmp.ne[1] = ubatch->n_tokens; tmp.ne[2] = 1; tmp.ne[3] = 1;
+            tmp.nb[0] = 2; tmp.nb[1] = 2*n_kv; tmp.nb[2] = tmp.nb[1]*tmp.ne[1]; tmp.nb[3] = tmp.nb[2];
+            tmp.data = full.data();
+            kv->set_input_kq_mask(&tmp, ubatch, causal_attn);
+            const int32_t * L = (const int32_t *) dst->data;
+            int bad = 0;
+            for (uint32_t t = 0; t < ubatch->n_tokens; ++t) {
+                for (uint32_t j = 0; j < n_kv; ++j) {
+                    const bool keep = ggml_fp16_to_fp32(full[(size_t) t*n_kv + j]) == 0.0f;
+                    if (keep != ((int32_t) j < L[t]) && bad++ < 5) {
+                        fprintf(stderr, "KQMASK mismatch t %u j %u keep %d L %d\n", t, j, keep, L[t]);
+                    }
+                }
+            }
+            fprintf(stderr, "KQMASK n_kv %u n_tokens %u L0 %d Llast %d pos0 %d bad %d\n", n_kv, ubatch->n_tokens, L[0],
+                L[ubatch->n_tokens - 1], ubatch->pos[0], bad);
+        }
+        return;
+    }
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::kq_mask_compact(const llama_ubatch & ubatch, bool causal_attn) const {
+    // decode and MTP verify (a few tokens) keep the full mask: their mask is small, and their kernels
+    // would need it expanded on the GPU
+    static const uint32_t n_min = [] { const char * e = getenv("LLAMA_KQ_MASK_COMPACT_MIN"); return e ? (uint32_t) atoi(e) : 32u; }();
+    if (ubatch.n_tokens < n_min) {
+        return false;
+    }
+    if (reserve) {
+        return kv->kq_mask_compact_static() && causal_attn;
+    }
+    return kv->kq_mask_prefix(&ubatch, n_kv, causal_attn, nullptr);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

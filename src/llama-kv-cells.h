@@ -394,6 +394,11 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // the position of every cell, -1 for empty ones (for scans that cannot afford a call per cell)
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());

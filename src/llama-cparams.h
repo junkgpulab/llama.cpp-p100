@@ -33,6 +33,7 @@ struct llama_cparams {
     float yarn_beta_slow;
 
     bool embeddings;
+    int32_t n_active_tokens = 0;  // llama_set_n_active_tokens
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
