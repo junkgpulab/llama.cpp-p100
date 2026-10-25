@@ -34,7 +34,7 @@ static_assert(offsetof(block_q5_K, scales) == 4 && offsetof(block_q5_K, qh) == 1
 static int q5k_rows_per_warp() {
     static const int rows = [] {
         const char * env = std::getenv("GGML_CUDA_P100_V2_R");
-        return env && std::strcmp(env, "4") == 0 ? 4 : 2;
+        return env && std::strcmp(env, "2") == 0 ? 2 : env && std::strcmp(env, "4") == 0 ? 4 : 8;
     }();
     return rows;
 }
@@ -97,7 +97,7 @@ static __device__ __forceinline__ half2 q5k_pair(uint32_t t, uint32_t qrot, uint
 #endif
 
 template <int R>
-static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 4 : 8)) void q5k_mmv(
+static __global__ __launch_bounds__(q5k_threads, (R == 8 ? 2 : (R == 4 ? 4 : 8))) void q5k_mmv(
         const char * __restrict__ weights, const float * __restrict__ x, float * __restrict__ dst,
         int k, int m, size_t row_stride) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
@@ -269,7 +269,9 @@ static int q5k_persistent_blocks(int device, int rows, size_t shared_bytes) {
     auto blocks = block_counts.find(key);
     if (blocks == block_counts.end()) {
         int count;
-        if (rows == 4) {
+        if (rows == 8) {
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&count, q5k_mmv<8>, q5k_threads, shared_bytes));
+        } else if (rows == 4) {
             CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&count, q5k_mmv<4>, q5k_threads, shared_bytes));
         } else {
             CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&count, q5k_mmv<2>, q5k_threads, shared_bytes));
@@ -308,7 +310,9 @@ bool ggml_cuda_p100_v2_q5k(
     const char * weights = static_cast<const char *>(src0->data);
     const float * input = static_cast<const float *>(src1->data);
     float * output = static_cast<float *>(dst->data);
-    if (rows == 4) {
+    if (rows == 8) {
+        q5k_mmv<8><<<grid, q5k_threads, shared_bytes, ctx.stream()>>>(weights, input, output, int(k), int(m), src0->nb[1]);
+    } else if (rows == 4) {
         q5k_mmv<4><<<grid, q5k_threads, shared_bytes, ctx.stream()>>>(weights, input, output, int(k), int(m), src0->nb[1]);
     } else {
         q5k_mmv<2><<<grid, q5k_threads, shared_bytes, ctx.stream()>>>(weights, input, output, int(k), int(m), src0->nb[1]);
