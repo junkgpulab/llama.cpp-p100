@@ -1,5 +1,6 @@
 #include "mmv-p100.cuh"
 #include "mmv-p100-v2-q5k.cuh"
+#include "mmv-p100-v2-q4k.cuh"
 
 // HIP and MUSA also glob this directory. They must retain their existing paths.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -651,7 +652,7 @@ bool ggml_cuda_p100_mmv(
         return env && std::strcmp(env, "1") == 0;
     }();
     // GLU is active only with a gate; glu_op alone may be uninitialized.
-    if (v2_enabled && src0->type == GGML_TYPE_Q5_K && !ids &&
+    if (v2_enabled && (src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q4_K) && !ids &&
         (!fusion || (!fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale &&
                      !fusion->gate_scale && !fusion->shared_up && !fusion->shared_gate && !fusion->shared_dst)) &&
         dst->ne[1] == 1 && src1->ne[1] == 1 &&
@@ -661,7 +662,8 @@ bool ggml_cuda_p100_mmv(
         if (reinterpret_cast<uintptr_t>(src0->data) % 16 != 0 || src0->nb[1] % 16 != 0) {
             return p100_decline("v2 Q5_K requires 16-byte aligned weight base/row stride", src0->type);
         }
-        if (ggml_cuda_p100_v2_q5k(ctx, src0, src1, dst)) {
+        if (src0->type == GGML_TYPE_Q4_K ? ggml_cuda_p100_v2_q4k(ctx, src0, src1, dst)
+                                         : ggml_cuda_p100_v2_q5k(ctx, src0, src1, dst)) {
             return true;
         }
     }
