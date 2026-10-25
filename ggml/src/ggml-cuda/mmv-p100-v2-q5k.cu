@@ -84,6 +84,14 @@ static __device__ __forceinline__ half2 q5k_half2(uint32_t low, uint32_t high, i
                                     __ushort_as_half(static_cast<unsigned short>(magic >> 16)));
     return __hsub2(value, __float2half2_rn(1024.0f));
 }
+static __device__ __forceinline__ half2 q5k_pair(uint32_t t, uint32_t qh4) {
+    uint32_t y, magic;
+    asm("lop3.b32 %0, %1, 0x00100010, 0x64006400, 0xea;" : "=r"(y) : "r"(qh4));
+    asm("lop3.b32 %0, %1, 0x000f000f, %2, 0xea;" : "=r"(magic) : "r"(t), "r"(y));
+    union { uint32_t u; half2 h; } c;
+    c.u = magic;
+    return __hsub2(c.h, __float2half2_rn(1024.0f));
+}
 #endif
 
 template <int R>
@@ -119,7 +127,10 @@ static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
         // e is in [0,122] for finite FP32 input, so both powers of two are
         // normal FP32 values; constructing them avoids a libdevice ldexp call.
         const float prescale = __uint_as_float(uint32_t(127 - e) << 23);
-        reinterpret_cast<half *>(input)[32 * g + lane] = __float2half_rn(value * prescale);
+        // Weights are paired (byte0,byte2),(byte1,byte3) of each 4-weight chunk, so the
+        // activations are stored with bits 0 and 1 of the chunk position swapped.
+        reinterpret_cast<half *>(input)[32 * g + (lane & ~3) + ((lane & 1) << 1) + ((lane >> 1) & 1)] =
+            __float2half_rn(value * prescale);
         float sum = value;
 #pragma unroll
         for (int offset = 16; offset; offset >>= 1) {
@@ -205,10 +216,13 @@ static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
                 const uint2 lo = tl[r];
                 const uint2 hi = tq[r];
                 half2 partial = __float2half2_rn(0.0f);
-                partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4140, group), a0, partial);
-                partial = __hfma2(q5k_half2(lo.x, hi.x, 0x4342, group), a1, partial);
-                partial = __hfma2(q5k_half2(lo.y, hi.y, 0x4140, group), a2, partial);
-                partial = __hfma2(q5k_half2(lo.y, hi.y, 0x4342, group), a3, partial);
+                const int qsh = 4 * (group & 1);
+                const uint32_t xl = hi.x >> group;
+                const uint32_t xh = hi.y >> group;
+                partial = __hfma2(q5k_pair(lo.x >> qsh, xl << 4), a0, partial);
+                partial = __hfma2(q5k_pair((lo.x >> qsh) >> 8, xl >> 4), a1, partial);
+                partial = __hfma2(q5k_pair(lo.y >> qsh, xh << 4), a2, partial);
+                partial = __hfma2(q5k_pair((lo.y >> qsh) >> 8, xh >> 4), a3, partial);
                 const float2 p = __half22float2(partial);
                 const float dot = (p.x + p.y) * rescale;
                 acc[r] += (d * sc) * dot - (dmin * mn) * sx;
