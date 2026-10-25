@@ -97,7 +97,7 @@ static __device__ __forceinline__ half2 q5k_pair(uint32_t t, uint32_t qrot, uint
 #endif
 
 template <int R>
-static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 6 : 8)) void q5k_mmv(
+static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 4 : 8)) void q5k_mmv(
         const char * __restrict__ weights, const float * __restrict__ x, float * __restrict__ dst,
         int k, int m, size_t row_stride) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
@@ -129,10 +129,18 @@ static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 6 : 8)) void q5k_mmv(
         // e is in [0,122] for finite FP32 input, so both powers of two are
         // normal FP32 values; constructing them avoids a libdevice ldexp call.
         const float prescale = __uint_as_float(uint32_t(127 - e) << 23);
-        // Weights are paired (byte0,byte2),(byte1,byte3) of each 4-weight chunk, so the
-        // activations are stored with bits 0 and 1 of the chunk position swapped.
-        reinterpret_cast<half *>(input)[32 * g + (lane & ~3) + ((lane & 1) << 1) + ((lane >> 1) & 1)] =
-            __float2half_rn(value * prescale * ((g & 1) ? 0.0625f : 1.0f));
+        // Layout per 256-weight block (256 halves): [vec v=0 for 16 lanes][vec v=1 ...],
+        // lane slot l16 = 2*group+half holds its 8 weights of vector v. Within each
+        // 4-weight chunk bits 0 and 1 of the position are swapped so weights are
+        // paired (byte0,byte2),(byte1,byte3).
+        {
+            const int gg = g & 7;
+            const int h = lane >> 4;
+            const int v = (lane >> 3) & 1;
+            const int pos = (lane & 4) | ((lane & 1) << 1) | ((lane >> 1) & 1);
+            reinterpret_cast<half *>(input)[(g >> 3) * 256 + v * 128 + (2 * gg + h) * 8 + pos] =
+                __float2half_rn(value * prescale * ((g & 1) ? 0.0625f : 1.0f));
+        }
         float sum = value;
 #pragma unroll
         for (int offset = 16; offset; offset >>= 1) {
@@ -147,89 +155,96 @@ static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 6 : 8)) void q5k_mmv(
 
     // Four lanes cover one 32-weight sub-block, eight adjacent weights each.
     // Each half2 partial is reset before crossing a sub-block boundary.
-    const int group = lane / 4;
-    const int segment = lane & 3;
+    // A warp handles a PAIR of blocks of one row: lanes 0-15 block 2*ip, lanes
+    // 16-31 block 2*ip+1. Two lanes cover one 32-weight sub-block (16 weights
+    // each), so the scale work is paid once per 16 weights.
+    const int bp = lane >> 4;
+    const int l16 = lane & 15;
+    const int group = l16 >> 1;
+    const int half_sel = l16 & 1;
     const int n_blocks = k / QK_K;
+    const int n_pairs = (n_blocks + 1) / 2;
     const int qpos = (group & 1) ? 8 : 4;
     const uint32_t nib_mask = (group & 1) ? 0x00f000f0u : 0x000f000fu;
     const uint32_t qh_mask = (group & 1) ? 0x01000100u : 0x00100010u;
     const uint32_t rot_a = uint32_t(group - qpos) & 31u;
     const uint32_t rot_b = uint32_t(group + 8 - qpos) & 31u;
+    const int qs_off = 48 + 32 * (group >> 1) + 16 * half_sel;
+    const int qh_off = 16 + 16 * half_sel;
+    const int shift = 8 * (group & 3);
     const int64_t n_groups = (int64_t(m) + warps * R - 1) / (warps * R);
     for (int64_t row_group = blockIdx.x; row_group < n_groups; row_group += gridDim.x) {
         const int64_t first_row = (row_group * warps + warp) * R;
         float acc[R] = {};
-        // Every lane loads its own qs/qh bytes (8 B each) plus the 16-B header
-        // (broadcast), so no shuffles are needed. Rows are clamped, not masked.
         const char * rowp[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int64_t row = first_row + r < m ? first_row + r : m - 1;
             rowp[r] = weights + row * row_stride;
         }
-        const int qs_off = 48 + 32 * (group >> 1) + 8 * segment;
-        const int qh_off = 16 + 8 * segment;
-        uint4 th[R]; uint2 tl[R]; uint2 tq[R];
+        uint4 th[R], tl[R], tq[R];
+        {
+            const int blk = bp < n_blocks ? bp : n_blocks - 1;
 #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            th[r] = __ldg(reinterpret_cast<const uint4 *>(rowp[r]));
-            tl[r] = __ldg(reinterpret_cast<const uint2 *>(rowp[r] + qs_off));
-            tq[r] = __ldg(reinterpret_cast<const uint2 *>(rowp[r] + qh_off));
+            for (int r = 0; r < R; ++r) {
+                const char * p = rowp[r] + size_t(blk) * sizeof(block_q5_K);
+                th[r] = __ldg(reinterpret_cast<const uint4 *>(p));
+                tl[r] = __ldg(reinterpret_cast<const uint4 *>(p + qs_off));
+                tq[r] = __ldg(reinterpret_cast<const uint4 *>(p + qh_off));
+            }
         }
-        for (int ib = 0; ib < n_blocks; ++ib) {
-            // Fetch all R next-block vectors before consuming any current vector.
-            // The final iteration and padded rows keep zero tiles, with no loads.
-            uint4 nh[R]; uint2 nl[R]; uint2 nq[R];
-            const int nb = ib + 1 < n_blocks ? ib + 1 : ib;
+        for (int ip = 0; ip < n_pairs; ++ip) {
+            const int ib = 2 * ip + bp;
+            const bool valid = ib < n_blocks;
+            const int nblk = 2 * (ip + 1 < n_pairs ? ip + 1 : ip) + bp;
+            const int nb = nblk < n_blocks ? nblk : n_blocks - 1;
+            uint4 nh[R], nl[R], nq[R];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const char * p = rowp[r] + size_t(nb) * sizeof(block_q5_K);
                 nh[r] = __ldg(reinterpret_cast<const uint4 *>(p));
-                nl[r] = __ldg(reinterpret_cast<const uint2 *>(p + qs_off));
-                nq[r] = __ldg(reinterpret_cast<const uint2 *>(p + qh_off));
+                nl[r] = __ldg(reinterpret_cast<const uint4 *>(p + qs_off));
+                nq[r] = __ldg(reinterpret_cast<const uint4 *>(p + qh_off));
             }
-            const int g = 8 * ib + group;
-            const int input_pair = 128 * ib + 16 * group + 4 * segment;
-            // Every lane starts on a 16-B boundary. Force a single vector LDS so
-            // the compiler cannot split this into four bank-conflicting loads.
-            uint4 activation;
-            const uint32_t input_address = static_cast<uint32_t>(__cvta_generic_to_shared(input + input_pair));
+            const int cb = valid ? ib : n_blocks - 1;
+            const int g = 8 * cb + group;
+            const half2 * act = input + cb * 128 + l16 * 4;
+            uint4 act0, act1;
+            const uint32_t a_addr = static_cast<uint32_t>(__cvta_generic_to_shared(act));
             asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-                         : "=r"(activation.x), "=r"(activation.y), "=r"(activation.z), "=r"(activation.w)
-                         : "r"(input_address) : "memory");
-            const half2 a0 = q5k_half2_bits(activation.x);
-            const half2 a1 = q5k_half2_bits(activation.y);
-            const half2 a2 = q5k_half2_bits(activation.z);
-            const half2 a3 = q5k_half2_bits(activation.w);
-            const float rescale = __uint_as_float(uint32_t(127 + exponent[g]) << 23);
-            const float sx = segment == 0 ? sum_x[g] : 0.0f;
+                         : "=r"(act0.x), "=r"(act0.y), "=r"(act0.z), "=r"(act0.w) : "r"(a_addr) : "memory");
+            asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(act1.x), "=r"(act1.y), "=r"(act1.z), "=r"(act1.w) : "r"(a_addr + 256) : "memory");
+            const half2 a0 = q5k_half2_bits(act0.x), a1 = q5k_half2_bits(act0.y);
+            const half2 a2 = q5k_half2_bits(act0.z), a3 = q5k_half2_bits(act0.w);
+            const half2 a4 = q5k_half2_bits(act1.x), a5 = q5k_half2_bits(act1.y);
+            const half2 a6 = q5k_half2_bits(act1.z), a7 = q5k_half2_bits(act1.w);
+            const float vm = valid ? 1.0f : 0.0f;
+            const float rescale = __uint_as_float(uint32_t(127 + exponent[g]) << 23) * vm;
+            const float sxh = sum_x[g] * (0.5f * vm);
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                // Header and payload are shuffled from the registers that received
-                // the vectors; no per-weight byte loads, and no header rereads.
                 const uint32_t dm = th[r].x;
-                const uint32_t s0 = th[r].y;
-                const uint32_t s1 = th[r].z;
-                const uint32_t s2 = th[r].w;
-                const int shift = 8 * (group & 3);
-                const uint32_t b0 = (s0 >> shift) & 255;
-                const uint32_t b1 = (s1 >> shift) & 255;
-                const uint32_t b2 = (s2 >> shift) & 255;
-                // Exactly get_scale_min_k4: bytes 0..3, 4..7, 8..11 of scales.
+                const uint32_t b0 = (th[r].y >> shift) & 255;
+                const uint32_t b1 = (th[r].z >> shift) & 255;
+                const uint32_t b2 = (th[r].w >> shift) & 255;
                 const int sc = group < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4);
                 const int mn = group < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
                 const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dm)));
                 const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(dm >> 16)));
-                const uint2 lo = tl[r];
-                const uint2 hi = tq[r];
-                half2 partial = __float2half2_rn(0.0f);
-                partial = __hfma2(q5k_pair(lo.x, __funnelshift_r(hi.x, hi.x, rot_a), nib_mask, qh_mask), a0, partial);
-                partial = __hfma2(q5k_pair(lo.x >> 8, __funnelshift_r(hi.x, hi.x, rot_b), nib_mask, qh_mask), a1, partial);
-                partial = __hfma2(q5k_pair(lo.y, __funnelshift_r(hi.y, hi.y, rot_a), nib_mask, qh_mask), a2, partial);
-                partial = __hfma2(q5k_pair(lo.y >> 8, __funnelshift_r(hi.y, hi.y, rot_b), nib_mask, qh_mask), a3, partial);
-                const float2 p = __half22float2(partial);
+                const uint4 lo = tl[r];
+                const uint4 hi = tq[r];
+                half2 pa = __hmul2(q5k_pair(lo.x, __funnelshift_r(hi.x, hi.x, rot_a), nib_mask, qh_mask), a0);
+                half2 pb = __hmul2(q5k_pair(lo.x >> 8, __funnelshift_r(hi.x, hi.x, rot_b), nib_mask, qh_mask), a1);
+                pa = __hfma2(q5k_pair(lo.y, __funnelshift_r(hi.y, hi.y, rot_a), nib_mask, qh_mask), a2, pa);
+                pb = __hfma2(q5k_pair(lo.y >> 8, __funnelshift_r(hi.y, hi.y, rot_b), nib_mask, qh_mask), a3, pb);
+                pa = __hfma2(q5k_pair(lo.z, __funnelshift_r(hi.z, hi.z, rot_a), nib_mask, qh_mask), a4, pa);
+                pb = __hfma2(q5k_pair(lo.z >> 8, __funnelshift_r(hi.z, hi.z, rot_b), nib_mask, qh_mask), a5, pb);
+                pa = __hfma2(q5k_pair(lo.w, __funnelshift_r(hi.w, hi.w, rot_a), nib_mask, qh_mask), a6, pa);
+                pb = __hfma2(q5k_pair(lo.w >> 8, __funnelshift_r(hi.w, hi.w, rot_b), nib_mask, qh_mask), a7, pb);
+                const float2 p = __half22float2(__hadd2(pa, pb));
                 const float dot = (p.x + p.y) * rescale;
-                acc[r] += (d * sc) * dot - (dmin * mn) * sx;
+                acc[r] += (d * sc) * dot - (dmin * mn) * sxh;
             }
 #pragma unroll
             for (int r = 0; r < R; ++r) {
