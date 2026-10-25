@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <random>
 #include <string>
 #include <vector>
 
@@ -90,6 +91,24 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// speculative-sampling verify, for drafts sampled from known distributions (dists[i] is the
+// distribution draft[i] was drawn from, candidates with normalized p). draft[i] is accepted with
+// probability min(1, p(draft[i]) / q(draft[i])), where p is the distribution the sampler chain
+// would draw from at idxs[i]; on rejection a token is drawn from max(p - q, 0), normalized.
+// every returned token is distributed exactly as common_sampler_sample would draw it, and the
+// logits are not touched. positions where the grammar applies use the plain rule (accept the
+// target's own sample if it matches).
+// block verification's decision (Sun et al., arXiv:2403.10444, Algorithm 2), exposed for tests:
+// P[i] target distribution after X^i (i = 0..draft.size()), dists[i] the distribution draft[i]
+// was drawn from, ids[i] a token drawn from P[i]. Returns the accepted count, sets the next token y.
+size_t common_spec_block_verify(const std::vector<std::vector<llama_token_data>> & P,
+                                const std::vector<std::vector<llama_token_data>> & dists,
+                                const llama_tokens & draft, const std::vector<llama_token> & ids,
+                                std::mt19937 & rng, llama_token & y, std::vector<double> & keep);
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_dist(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & dists, std::mt19937 & rng);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
