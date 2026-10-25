@@ -95,7 +95,7 @@ static __device__ __forceinline__ half2 q5k_pair(uint32_t t, uint32_t qh4) {
 #endif
 
 template <int R>
-static __global__ __launch_bounds__(q5k_threads, 8) void q5k_mmv(
+static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 6 : 8)) void q5k_mmv(
         const char * __restrict__ weights, const float * __restrict__ x, float * __restrict__ dst,
         int k, int m, size_t row_stride) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
