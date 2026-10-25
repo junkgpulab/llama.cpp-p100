@@ -2,6 +2,12 @@
 
 #include "common.cuh"
 
+// PROBE SWITCHES (sed 0->1); both break results, valid only on fixed-work benchmarks
+#define P100_NOY     0
+#define P100_MEMONLY 0
+#define P100_NOUNPACK 0
+
+
 #include <cstdint>
 
 static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
@@ -621,7 +627,13 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
-#define VDR_Q6_K_Q8_1_MMVQ 2
+// P100 (sm_60): raised from 1 to 2. See vdr2_analysis.md for the derivation. This does NOT
+// widen the ql/qh global loads (block_q6_K's 210-byte stride keeps their alignment at 2 bytes
+// for ~half of all row-blocks, so a uniform, branch-free path must stay on get_int_b2 for both
+// values regardless of vdr). The win is eliminating the *redundant* re-fetch of bq6_K->d, the
+// two `scales` bytes, and the two q8_1 `.ds` scales, all four of which are IDENTICAL between
+// iqs and iqs+1 but were previously re-read from scratch by two separate warp lanes.
+#define VDR_Q6_K_Q8_1_MMVQ 4
 #define VDR_Q6_K_Q8_1_MMQ  8
 
 // contiguous v/x values
@@ -1076,33 +1088,75 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 
     const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
 
-    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
-    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
-    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    constexpr int vdr = VDR_Q6_K_Q8_1_MMVQ;
 
-    int vl[VDR_Q6_K_Q8_1_MMVQ];
-    int vh[VDR_Q6_K_Q8_1_MMVQ];
-#pragma unroll
-    for (int j = 0; j < VDR_Q6_K_Q8_1_MMVQ; ++j) {
-        vl[j] = get_int_b2(bq6_K->ql, iqs + j);
-        vh[j] = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4) + j) >> vh_shift;
-    }
+    // mmvq.cu drives kqs = vdr * (tid % (qi/vdr)), so iqs is a multiple of vdr. bq8_offset,
+    // scale_offset and vh_shift are floor-divisions whose moduli (QI6_K/4 == 8, QI6_K/8 == 4)
+    // are multiples of vdr, so all vdr consecutive indices share them, while the ql index, the
+    // qh index and the q8_1 lane index are each consecutive across the group.
+    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift     = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    const int qh_idx       = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
 
     const int8_t * scales = bq6_K->scales + scale_offset;
 
-    int    u[VDR_Q6_K_Q8_1_MMVQ*QR6_K];
-    float d8[QR6_K];
+    // Keep each i's dot product in an integer accumulator across the whole vdr group before
+    // touching floats. scales[4*i] and the q8_1 scale are constant over the group, so the
+    // per-lane integer multiply by the scale -- three XMADs on Pascal, which has no IMAD -- and
+    // the int->float conversion collapse from once per (l, i) pair to once per i. dp4a already
+    // takes an accumulator, so chaining the group costs nothing.
+    //
+    // Peak |acc| is vdr*4*128*128 = 262144, comfortably inside float's exactly-representable
+    // integer range, so folding the group before the conversion loses nothing; it also rounds
+    // twice per i instead of four times per i, so it is slightly more accurate than before.
+    int acc[QR6_K] = { 0 };
 
 #pragma unroll
-    for (int i = 0; i < QR6_K; ++i) {
+    for (int l = 0; l < vdr; ++l) {
+        const int vl = get_int_b2(bq6_K->ql, iqs + l);
+        const int vh = get_int_b2(bq6_K->qh, qh_idx + l) >> vh_shift;
+
 #pragma unroll
-        for (int j = 0; j < VDR_Q6_K_Q8_1_MMVQ; ++j) {
-            u[VDR_Q6_K_Q8_1_MMVQ*i + j] = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1 + j);
+        for (int i = 0; i < QR6_K; ++i) {
+            // 6-bit quant biased by -32, pre-scaled by 4 so the sign lands in bit 7; the factor
+            // of 4 is undone once in the return statement.
+#if P100_NOUNPACK
+            // PROBE: keep both loads and the dp4a, drop the shift/mask unpack that every column
+            // currently redoes, to price how much of the kernel that redundancy is worth.
+            const int vil4 = vl;
+            const int vih4 = vh;
+#else
+            const int vil4 = (4*i >= 2 ? (vl >> (4*i - 2)) : (vl << (2 - 4*i))) & 0x3C3C3C3C;
+            const int vih4 = ((vh << (6 - 4*i)) & 0xC0C0C0C0) ^ 0x80808080;
+#endif
+
+#if P100_NOY
+            const int u = 0x01010101;
+#else
+            const int u = get_int_b4(bq8_1[bq8_offset + 2*i].qs, (iqs + l) % QI8_1);
+#endif
+
+#if P100_MEMONLY
+            acc[i] += (vil4 | vih4) ^ u;
+#else
+            acc[i] = ggml_cuda_dp4a(vil4 | vih4, u, acc[i]);
+#endif
         }
-        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
     }
 
-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+#if P100_NOY
+        sumf += (1.0f * (float) scales[4*i]) * (float) acc[i];
+#else
+        sumf += (__low2float(bq8_1[bq8_offset + 2*i].ds) * (float) scales[4*i]) * (float) acc[i];
+#endif
+    }
+
+    const float d = bq6_K->d; // via an initialisation: half * float is ambiguous as an expression
+    return d * 0.25f * sumf;  // 0.25f undoes the pre-scaling above; exact, a power of two
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2

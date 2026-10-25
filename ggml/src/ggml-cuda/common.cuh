@@ -741,9 +741,27 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     return __dp4a(a, b, c);
 #else // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
-    const int8_t * a8 = (const int8_t *) &a;
-    const int8_t * b8 = (const int8_t *) &b;
-    return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
+    // sm_60 and older lack DP4A. Use PRMT to sign-extend byte pairs into packed
+    // 16-bit halves, then two XMADs per pair via the .H1 half-register selector.
+    // 8 instructions instead of 12 (6*BFE + 2*SHR + 4*XMAD). Bit-exact.
+    int a01, a23, b01, b23;
+    asm("prmt.b32 %0, %1, 0, 0x9180;" : "=r"(a01) : "r"(a));
+    asm("prmt.b32 %0, %1, 0, 0xB3A2;" : "=r"(a23) : "r"(a));
+    asm("prmt.b32 %0, %1, 0, 0x9180;" : "=r"(b01) : "r"(b));
+    asm("prmt.b32 %0, %1, 0, 0xB3A2;" : "=r"(b23) : "r"(b));
+    asm("{ .reg .s16 al,ah,bl,bh;\n\t"
+        "mov.b32 {al,ah}, %1;\n\t"
+        "mov.b32 {bl,bh}, %2;\n\t"
+        "mad.wide.s16 %0, al, bl, %0;\n\t"
+        "mad.wide.s16 %0, ah, bh, %0;\n\t}"
+        : "+r"(c) : "r"(a01), "r"(b01));
+    asm("{ .reg .s16 al,ah,bl,bh;\n\t"
+        "mov.b32 {al,ah}, %1;\n\t"
+        "mov.b32 {bl,bh}, %2;\n\t"
+        "mad.wide.s16 %0, al, bl, %0;\n\t"
+        "mad.wide.s16 %0, ah, bh, %0;\n\t}"
+        : "+r"(c) : "r"(a23), "r"(b23));
+    return c;
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
 
 #endif // defined(GGML_USE_HIP)
@@ -931,6 +949,15 @@ static const uint3 init_fastdiv_values(uint64_t d_64) {
     // pack divisor as well to reduce error surface
     return make_uint3(mp, L, d);
 }
+
+// fastdiv evaluates (mulhi(n, mp) + n) >> L entirely in 32 bits, but the
+// Granlund-Montgomery round-up scheme needs a 33rd bit: the `hi + n` add can
+// carry out and is silently truncated. Verified by exhaustive test over all
+// n in [0, 2^32) for 53 representative divisors: exact for every numerator
+// n <= 2^31, first failure at n = 2^31 + 1 (worst case d = 2^30 + 1).
+// Divisors above 2^31 yield L = 32 and are broken for every n >= d.
+// Callers must bound BOTH the numerator and the divisor by this value.
+#define GGML_CUDA_FASTDIV_MAX 2147483648LL
 
 static __device__ __forceinline__ uint32_t fastdiv(uint32_t n, const uint3 fastdiv_values) {
     // expects fastdiv_values to contain <mp, L, divisor> in <x, y, z>
@@ -1274,6 +1301,15 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    // Generation of ggml_backend_cuda_context::mmvq_q8_1_ptr this graph was captured
+    // against. The q8_1 activation cache is a raw grow-only cudaMalloc whose pointer is
+    // baked into captured kernel parameters, and ggml_cuda_graph_update_required() compares
+    // only ggml node properties -- it cannot see an internal buffer move. Without this a
+    // graph captured before a realloc would replay against a freed pointer: silent garbage,
+    // not a crash. Not reachable in the documented configuration, because the first prefill
+    // drives the buffer to its global maximum before the steady-state decode graph is
+    // captured, but nothing enforced that ordering.
+    int mmvq_q8_1_epoch = -1;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1447,10 +1483,88 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
-    cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
+    // Peer copies are issued on a dedicated stream instead of the compute stream.
+    //
+    // The tensor-parallel all-reduce exchanges partial sums in both directions at once. When the
+    // copies sat on the compute streams they serialised: copy 0->1 was issued on stream 0 and
+    // stream 1 was then made to wait on it, so copy 1->0 -- issued on stream 1 -- could not start
+    // until copy 0->1 had finished. PCIe here is full duplex (measured 9.74 GB/s *each way*
+    // simultaneously), so that wasted a full copy duration per exchange.
+    //
+    // work_event marks everything already enqueued on the compute stream. The copy stream waits on
+    // it rather than on the compute stream itself, so a wait installed on the compute stream by
+    // some *other* device's exchange does not push this device's copy behind it.
+    cudaStream_t copy_stream = nullptr;
+    cudaEvent_t  work_event  = nullptr;
+
+    // Record "everything enqueued on the compute stream so far". Must be called after anything
+    // that enqueues work which a later peer copy might read.
+    void record_work() {
+        if (work_event == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaEventCreateWithFlags(&work_event, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(work_event, stream()));
+    }
+
+    // Staging buffers for compressed peer copies (see ggml_backend_cuda_cpy_tensor_async).
+    // Two of them, and they must stay distinct: in a butterfly all-reduce a device is both a
+    // sender and a receiver in the same step, so one shared buffer would have the outgoing
+    // narrow overwrite the partial that just landed from the peer.
+    // Allocated once and grown on demand -- sizes are stable across a run, so no cudaMalloc
+    // ends up on the hot path.
+    enum peer_stage_dir { PEER_STAGE_OUT = 0, PEER_STAGE_IN = 1 };
+    // Incremented every time mmvq_q8_1_ptr is (re)allocated, so a captured CUDA graph that
+    // holds the old pointer in its kernel parameters can be detected and re-captured.
+    int mmvq_q8_1_epoch = 0;
+
+    void * peer_stage[2]     = { nullptr, nullptr };
+    size_t peer_stage_cap[2] = { 0, 0 };
+    // Signals that the landing buffer has been widened and may be refilled. A sender waits on the
+    // receiver's copy of this before overwriting it.
+    cudaEvent_t peer_stage_free = nullptr;
+    // -1 = not yet probed, 0 = partials are not f16-exact (never compress), 1 = safe to compress
+    int    peer_f16_ok       = -1;
+
+    void * peer_stage_get(peer_stage_dir dir, size_t size) {
+        if (peer_stage_cap[dir] < size) {
+            ggml_cuda_set_device(device);
+            if (peer_stage[dir] != nullptr) {
+                CUDA_CHECK(cudaFree(peer_stage[dir]));
+            }
+            CUDA_CHECK(cudaMalloc(&peer_stage[dir], size));
+            peer_stage_cap[dir] = size;
+        }
+        return peer_stage[dir];
+    }
+
+    // Token-chunked exchange source (GGML_CUDA_XCHG_CHUNKS): graph compute sets xchg_want for a
+    // graph's last node; the fold GEMM then runs it in token chunks, recording ev[c] after chunk c,
+    // so the tensor-parallel all-reduce can send chunk c while later chunks still compute.
+    bool xchg_want = false;
+    struct {
+        const void * data = nullptr;
+        int          n    = 0;
+        int64_t      col[9] = {0};     // chunk c covers tokens [col[c], col[c+1])
+        int64_t      rows = 0;         // elements per token
+        cudaEvent_t  ev[8] = {nullptr};
+        bool         direct = false;   // outputs were also written into the peer's landing buffer
+    } xchg;
+    // the other GPU of a two-GPU tensor split (set when the P2P all-reduce comes up)
+    ggml_backend_cuda_context * xchg_peer = nullptr;
+
+    cudaStream_t peer_copy_stream() {
+        if (copy_stream == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
+        }
+        return copy_stream;
+    }
+
+    cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
 
@@ -1509,11 +1623,35 @@ struct ggml_backend_cuda_context {
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
+        mmvq_q8_1_invalidate();
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();
+
+    // Cache of the q8_1-quantized activation used by mul_mat_vec_q. Several matmuls in a
+    // transformer block share one activation -- q/k/v read the same normed input, gate/up read
+    // another -- and it was being re-quantized once per matmul (quantize_q8_1 was called exactly
+    // as many times as mul_mat_vec_q). Keyed on the src1 *node* pointer, which ggml computes
+    // once per graph evaluation so its contents are fixed, plus everything the quantization
+    // depends on. Invalidated at the start of every graph compute, because node pointers are
+    // reused across evaluations with new data.
+    // Per device: one context serves every device it was given work for.
+    const ggml_tensor * mmvq_q8_1_src1[GGML_CUDA_MAX_DEVICES] = { nullptr };
+    const void *        mmvq_q8_1_data[GGML_CUDA_MAX_DEVICES] = { nullptr };
+    ggml_type           mmvq_q8_1_type[GGML_CUDA_MAX_DEVICES];
+    size_t              mmvq_q8_1_need[GGML_CUDA_MAX_DEVICES] = { 0 };
+    void *              mmvq_q8_1_ptr [GGML_CUDA_MAX_DEVICES] = { nullptr };
+    size_t              mmvq_q8_1_cap [GGML_CUDA_MAX_DEVICES] = { 0 };
+
+    void mmvq_q8_1_invalidate() {
+        for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+            mmvq_q8_1_src1[i] = nullptr;
+            mmvq_q8_1_data[i] = nullptr;
+            mmvq_q8_1_type[i] = GGML_TYPE_COUNT;
+        }
+    }
 
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {

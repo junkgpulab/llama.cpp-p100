@@ -1,9 +1,12 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-gemm.cuh"
+#include "fattn-q4p.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include <vector>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -701,8 +704,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // The tile kernel dequantizes a q4_0 cache straight into its shared tile, so it no longer
+    // pays launch_fattn's whole-cache f16 conversion. That moved the vec/tile crossover: at
+    // kv=262144 tile does nb=4 in 4176 us where vec needs 4286 us for nb=2. Prefer it wherever
+    // that path exists (GGML_CUDA_FA_TILE_Q4_0=0 to force the old split).
+    const bool tile_q4_0_direct = ggml_cuda_fattn_tile_q4_0_direct(dst);
+
     // If there are no tensor cores available, use the generic tile kernel:
-    if (can_use_vector_kernel) {
+    if (can_use_vector_kernel && !tile_q4_0_direct) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
                 if (!gqa_opt_applies) {
@@ -710,7 +719,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // GGML_CUDA_FA_VEC_MAX_Q: largest batch a quantized cache without a direct tile path sends
+            // to vec (two tokens per block). Above it the tile kernel first converts the whole K/V cache
+            // to f16 in pool scratch, which grows with the context.
+            static const int vec_max_q = [] { const char * e = getenv("GGML_CUDA_FA_VEC_MAX_Q"); return e ? atoi(e) : 2; }();
+            if (Q->ne[1] <= vec_max_q) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
@@ -718,8 +731,48 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// Compact causal mask (I32 [nq], ggml_flash_attn_ext): query t keeps its first L_t keys. Every
+// kernel choice and size check below is made on the equivalent f16 [nkv x nq] mask descriptor, so
+// they answer exactly as for the full mask. The GEMM path reads the compact form directly
+// (fattn-gemm.cu); the other kernels get the full mask expanded into pool scratch, which is small
+// for them (few queries, or few keys).
+static bool fattn_mask_is_compact(const ggml_tensor * dst) {
+    return dst->src[3] != nullptr && dst->src[3]->type == GGML_TYPE_I32;
+}
+
+static void fattn_mask_f16_view(const ggml_tensor * dst, ggml_tensor & d2, ggml_tensor & m2, void * data) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    d2 = *dst;
+    m2 = *dst->src[3];
+    m2.type  = GGML_TYPE_F16;
+    m2.ne[0] = K->ne[1];
+    m2.ne[1] = Q->ne[1];
+    m2.ne[2] = 1;
+    m2.ne[3] = 1;
+    m2.nb[0] = sizeof(half);
+    m2.nb[1] = m2.nb[0]*m2.ne[0];
+    m2.nb[2] = m2.nb[1]*m2.ne[1];
+    m2.nb[3] = m2.nb[2];
+    m2.data  = data;
+    d2.src[3] = &m2;
+}
+
+static __global__ void fattn_mask_expand(const int32_t * __restrict__ L, half * __restrict__ M, const int64_t nkv) {
+    const int64_t t = blockIdx.y;
+    const int32_t l = L[t];
+    for (int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; j < nkv; j += (int64_t) gridDim.x*blockDim.x) {
+        M[t*nkv + j] = j < l ? __float2half(0.0f) : __float2half(-INFINITY);
+    }
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    if (fattn_mask_is_compact(dst)) {
+        ggml_tensor d2, m2;
+        fattn_mask_f16_view(dst, d2, m2, nullptr);
+        return ggml_cuda_flash_attn_ext_get_alloc_size(device, &d2);
+    }
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -728,6 +781,21 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
+    // The GEMM path dequantizes K/V one chunk at a time out of its own pool scratch, so it
+    // needs none of the whole-cache f16 staging reserved below. That staging is 512 MiB per
+    // GPU at 262144 context (2 of 4 KV heads x 256 dim x 262144 positions x 2 bytes, K and V),
+    // which is ~58k tokens of q4_0 KV cache -- so this early-out is the point of the path as
+    // much as the speed is.
+    if (ggml_cuda_fa_gemm_enabled() && ggml_cuda_flash_attn_ext_gemm_supported(dst) &&
+        ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_VOLTA) {
+        return ggml_nbytes(dst);
+    }
+
+    // The q4_0 decode/verify kernel reads the quantized cache directly, so it needs no staging.
+    if (ggml_cuda_fattn_q4p_supported(dst)) {
+        return ggml_nbytes(dst);
+    }
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
@@ -735,6 +803,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            // The tile kernel dequantizes a q4_0 cache into its shared tile, so that case
+            // needs none of the whole-cache f16 staging -- 512 MiB per GPU at 262144.
+            need_f16_K = !ggml_cuda_fattn_tile_q4_0_direct(dst);
+            need_f16_V = need_f16_K;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
@@ -754,8 +827,51 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (fattn_mask_is_compact(dst)) {
+        ggml_tensor d2, m2;
+        fattn_mask_f16_view(dst, d2, m2, nullptr);
+        if (ggml_cuda_fa_gemm_enabled() && ggml_cuda_flash_attn_ext_gemm_supported(&d2) &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA) {
+            ggml_cuda_flash_attn_ext_gemm(ctx, dst);   // reads the compact mask itself
+            return;
+        }
+        const int64_t nkv = m2.ne[0];
+        const int64_t nq  = m2.ne[1];
+        ggml_cuda_pool_alloc<half> full(ctx.pool(), nkv*nq);
+        fattn_mask_expand<<<dim3((unsigned) std::min<int64_t>((nkv + 255)/256, 256), (unsigned) nq), 256, 0, ctx.stream()>>>(
+            (const int32_t *) dst->src[3]->data, full.get(), nkv);
+        CUDA_CHECK(cudaGetLastError());
+        m2.data = full.get();
+        ggml_cuda_flash_attn_ext_dispatch(ctx, &d2);
+        return;
+    }
+    ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+
+    // cuBLAS-GEMM attention for pre-Volta. On Pascal the tile kernel runs at 18.6%
+    // of peak while cuBLAS reaches 13-15 TFLOPS at these same shapes; attention is ~86% of
+    // prefill at 262144 context.
+    // ON by default -- ggml_cuda_fa_gemm_enabled() is `!s || s[0] != '0'`. Set
+    // GGML_CUDA_FA_GEMM=0 to fall back to upstream. (This comment previously said the
+    // opposite, which is how a default-on precision regression went unnoticed.)
+    if (ggml_cuda_fa_gemm_enabled() && ggml_cuda_flash_attn_ext_gemm_supported(dst) &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA) {
+        ggml_cuda_flash_attn_ext_gemm(ctx, dst);
+        return;
+    }
+
+    // Few-token attention over a q4_0 cache on pre-Volta (decode and MTP verify).
+    if (ggml_cuda_fattn_q4p_supported(dst)) {
+        ggml_cuda_flash_attn_ext_q4p(ctx, dst);
+        return;
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -772,5 +888,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (fattn_mask_is_compact(dst)) {
+        ggml_tensor d2, m2;
+        fattn_mask_f16_view(dst, d2, m2, nullptr);
+        return ggml_cuda_get_best_fattn_kernel(device, &d2) != BEST_FATTN_KERNEL_NONE;
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

@@ -1,4 +1,5 @@
 #include "unary.cuh"
+#include <limits>
 #include "convert.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
@@ -303,8 +304,28 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 /* gated ops */
 
+// Reference form, used when the element count exceeds the fastdiv domain
+// (GGML_CUDA_FASTDIV_MAX). Correct for any size; just slower on sm_60.
 template <float (*op)(float), typename T>
-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+static __global__ void unary_gated_op_kernel_i64(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+
+    ggml_cuda_pdl_sync();
+    dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
+}
+
+// The row/column split is a multiply-shift rather than a division: sm_60 has no integer divider,
+// so the two 64-bit divisions the straightforward form needs dominate this kernel.
+template <float (*op)(float), typename T>
+static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const uint3 n, const int64_t o0, const int64_t o1) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -313,8 +334,9 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     }
 
     // perform base op and multiply with gate (either offset in same tensor or a separate one)
-    const int64_t j0 = (i / n) * o0 + (i % n);
-    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+    const uint2   rc = fast_div_modulo((uint32_t) i, n);
+    const int64_t j0 = int64_t(rc.x)*o0 + rc.y;
+    const int64_t j1 = o0 == o1 ? j0 : int64_t(rc.x)*o1 + rc.y;
 
     ggml_cuda_pdl_sync();
     dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]));
@@ -324,7 +346,11 @@ template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+    if (k <= int64_t(GGML_CUDA_FASTDIV_MAX) && n <= int64_t(GGML_CUDA_FASTDIV_MAX)) {
+        ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, init_fastdiv_values((uint32_t) n), o0, o1);
+    } else {
+        ggml_cuda_kernel_launch(unary_gated_op_kernel_i64<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+    }
 }
 
 template <float (*op)(float)>
@@ -413,14 +439,13 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 // swiglu_oai
 
 template <typename T>
-static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, float alpha, float limit) {
+static __global__ void swiglu_oai_kernel_i64(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, float alpha, float limit) {
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
     if (i >= k) {
         return;
     }
 
-    // perform base op and multiply with gate (either offset in same tensor or a separate one)
     const int64_t j0 = (i / n) * o0 + (i % n);
     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
 
@@ -431,9 +456,32 @@ static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, cons
 }
 
 template <typename T>
+static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, const int64_t k, const uint3 n, const int64_t o0, const int64_t o1, float alpha, float limit) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    // perform base op and multiply with gate (either offset in same tensor or a separate one)
+    const uint2   rc = fast_div_modulo((uint32_t) i, n);
+    const int64_t j0 = int64_t(rc.x)*o0 + rc.y;
+    const int64_t j1 = o0 == o1 ? j0 : int64_t(rc.x)*o1 + rc.y;
+
+    float xi = x[j0];
+    float gi = g[j1];
+
+    dst[i] = ggml_cuda_op_swiglu_oai_single(xi, gi, alpha, limit);
+}
+
+template <typename T>
 static void swiglu_oai_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const float alpha, const float limit, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
-    swiglu_oai_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, n, o0, o1, alpha, limit);
+    if (k <= int64_t(GGML_CUDA_FASTDIV_MAX) && n <= int64_t(GGML_CUDA_FASTDIV_MAX)) {
+        swiglu_oai_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, init_fastdiv_values((uint32_t) n), o0, o1, alpha, limit);
+    } else {
+        swiglu_oai_kernel_i64<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, n, o0, o1, alpha, limit);
+    }
 }
 
 void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -759,6 +807,50 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
         default:
             GGML_ABORT("Unsupported unary op for fused unary+mul");
     }
+}
+
+/* fused ADD (row bias) -> SOFTPLUS -> MUL (row scale): the delta net's gate, softplus(alpha + dt) * a.
+   Each value goes through exactly the unfused kernels' operations (op_add, op_softplus, op_mul), so the
+   result is bit-identical. */
+
+static __global__ void add_softplus_mul_f32(const float * x, const float * b, const float * m, float * dst,
+                                            const int ne0, const int nrows, const int64_t sx, const int64_t sd) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ne0*nrows) {
+        return;
+    }
+    const int r = i / ne0, c = i % ne0;
+    const float t = x[r*sx + c] + b[c];
+    dst[r*sd + c] = op_softplus(t) * m[c];
+}
+
+bool ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * sp, ggml_tensor * mul) {
+    if (ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS) {
+        return false;
+    }
+    const int64_t ne0 = add->ne[0], nrows = ggml_nrows(add);
+    auto is_row_vec = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->ne[0] == ne0 && ggml_nelements(t) == ne0 && ggml_is_contiguous(t);
+    };
+    const ggml_tensor * x = add->src[0], * b = add->src[1];
+    if (!ggml_are_same_shape(x, add)) {
+        std::swap(x, b);
+    }
+    const ggml_tensor * m = mul->src[0] == sp ? mul->src[1] : mul->src[0];
+    // a 2-d view of rows: x and mul contiguous within rows, rows of equal stride
+    auto rows2d = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && ggml_are_same_shape(t, add) &&
+            t->nb[2] == t->ne[1]*t->nb[1] && t->nb[3] == t->ne[2]*t->nb[2];
+    };
+    if (add->type != GGML_TYPE_F32 || !rows2d(x) || !rows2d(mul) || !is_row_vec(b) || !is_row_vec(m) ||
+            ne0*nrows > INT_MAX) {
+        return false;
+    }
+    const int n = (int) (ne0*nrows);
+    add_softplus_mul_f32<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data,
+        (const float *) m->data, (float *) mul->data, (int) ne0, (int) nrows, x->nb[1]/sizeof(float), mul->nb[1]/sizeof(float));
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 /* fused relu + sqr */
