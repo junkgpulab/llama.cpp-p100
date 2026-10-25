@@ -40,15 +40,8 @@ static __device__ __forceinline__ half2 q6k_half2_bits(uint32_t bits) {
 }
 
 // 4-byte load at a 2-byte aligned address; sh = 16 when the address is 2 mod 4.
-template <bool LAST = false>
-static __device__ __forceinline__ uint32_t q6k_ldw(const char * p, int sh) {
-    const uint32_t * a = reinterpret_cast<const uint32_t *>(reinterpret_cast<uintptr_t>(p) & ~uintptr_t(3));
-    const uint32_t w0 = __ldg(a);
-    uint32_t w1 = w0;
-    if (!LAST || sh) {
-        w1 = __ldg(a + 1);   // LAST: the word after an aligned scale tail would pass the block end
-    }
-    return __funnelshift_r(w0, w1, sh);
+static __device__ __forceinline__ uint32_t q6k_raw(const char * p) {
+    return __ldg(reinterpret_cast<const uint32_t *>(reinterpret_cast<uintptr_t>(p) & ~uintptr_t(3)));
 }
 
 template <int XS, int HS>
@@ -128,6 +121,9 @@ static __global__ __launch_bounds__(q6k_threads, (R == 8 ? 2 : (R == 4 ? 4 : 8))
     const int o_qb = o_qa + 32;
     const int o_qh = 128 + 32 * h + 4 * g;
     const int o_sc = 192 + 8 * h;
+    const int src_a = bp * 16 + (g < 7 ? l16 + 1 : l16 - 7);
+    const int src_n = bp * 16 + ((l16 + 1) & 15);
+    const int src_x = bp * 16 + (l16 ^ 8);
     const int sa = 24 - 8 * is, sb = 8 - 8 * is;
     const int64_t n_groups = (int64_t(m) + warps * R - 1) / (warps * R);
     for (int64_t row_group = blockIdx.x; row_group < n_groups; row_group += gridDim.x) {
@@ -142,15 +138,36 @@ static __global__ __launch_bounds__(q6k_threads, (R == 8 ? 2 : (R == 4 ? 4 : 8))
         for (int ip = 0; ip < n_pairs; ++ip) {
             const int ib = 2 * ip + bp;
             uint32_t qa[R], qb[R], qh[R], s0[R], s1[R], dh[R];
+            uint32_t ra[R], rb[R], rh[R], rs0[R], rs1[R], rt[R];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const char * p = rowp[r] + size_t(ib) * sizeof(block_q6_K);
-                qa[r] = q6k_ldw(p + o_qa, sh);
-                qb[r] = q6k_ldw(p + o_qb, sh);
-                qh[r] = q6k_ldw(p + o_qh, sh);
-                s0[r] = q6k_ldw(p + o_sc, sh);
-                s1[r] = q6k_ldw<true>(p + o_sc + 4, sh);
-                dh[r] = *reinterpret_cast<const unsigned short *>(p + 208);
+                // raw aligned words (odd blocks start 2 B off a word boundary)
+                ra[r] = q6k_raw(p + o_qa);
+                rb[r] = q6k_raw(p + o_qb);
+                rh[r] = q6k_raw(p + o_qh);
+                rs0[r] = q6k_raw(p + o_sc);
+                rs1[r] = q6k_raw(p + o_sc + 4);
+                if (bp) {
+                    rt[r] = __ldg(reinterpret_cast<const uint32_t *>(p + 206));
+                    dh[r] = rt[r] >> 16;
+                } else {
+                    rt[r] = 0;
+                    dh[r] = *reinterpret_cast<const unsigned short *>(p + 208);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                // Each lane needs the word after its own; its neighbour already loaded it.
+                const uint32_t na = __shfl_sync(q6k_mask, g == 0 ? rb[r] : ra[r], src_a);
+                const uint32_t nb = __shfl_sync(q6k_mask, g == 0 ? (h ? ra[r] : rh[r]) : rb[r], src_n);
+                const uint32_t nh = __shfl_sync(q6k_mask, (h == 0 && g == 0) ? rs0[r] : rh[r], src_n);
+                const uint32_t ns = __shfl_sync(q6k_mask, rs0[r], src_x);
+                qa[r] = __funnelshift_r(ra[r], na, sh);
+                qb[r] = __funnelshift_r(rb[r], nb, sh);
+                qh[r] = __funnelshift_r(rh[r], nh, sh);
+                s0[r] = __funnelshift_r(rs0[r], rs1[r], sh);
+                s1[r] = __funnelshift_r(rs1[r], h ? rt[r] : ns, sh);
             }
             const half * act = input + ib * 256 + l16 * 8;
             uint4 a0, a1;
