@@ -741,6 +741,17 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     return __dp4a(a, b, c);
 #else // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+#if defined(GGML_CUDA_P100_VMAD) && __CUDA_ARCH__ >= 600
+    // sm_60 (GP100) has no DP4A. PTX vmad (scalar MAC with byte selectors) avoids the
+    // byte extraction (BFE/SHR), cutting dot4 from ~15 to ~6.75 SASS instructions.
+    int r = c;
+    asm("vmad.s32.s32.s32 %0, %1.b0, %2.b0, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;"
+        : "+r"(r) : "r"(a), "r"(b));
+    return r;
+#else
     // sm_60 and older lack DP4A. Use PRMT to sign-extend byte pairs into packed
     // 16-bit halves, then two XMADs per pair via the .H1 half-register selector.
     // 8 instructions instead of 12 (6*BFE + 2*SHR + 4*XMAD). Bit-exact.
@@ -762,6 +773,7 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
         "mad.wide.s16 %0, ah, bh, %0;\n\t}"
         : "+r"(c) : "r"(a23), "r"(b23));
     return c;
+#endif // GGML_CUDA_P100_VMAD
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
 
 #endif // defined(GGML_USE_HIP)
