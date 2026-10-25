@@ -382,7 +382,11 @@ extern "C" {
     // Meta backend
     //
 
-#define GGML_BACKEND_META_MAX_DEVICES 16
+// 4 in this fork (upstream: 16). ggml_backend_meta_split_state holds 16 segments per device, and
+// the meta backend copies it thousands of times per graph rebuild. At 16 devices it is ~2 KB, and
+// shrinking it took a rebuild of the verify graph from 20-30 to 16-25 ms. The fork targets two
+// GPUs (OPTLOG 192).
+#define GGML_BACKEND_META_MAX_DEVICES 4
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:
