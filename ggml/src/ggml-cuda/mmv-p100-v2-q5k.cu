@@ -182,29 +182,17 @@ static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 3 : 6)) void q5k_mmv(
             const int64_t row = first_row + r < m ? first_row + r : m - 1;
             rowp[r] = weights + row * row_stride;
         }
-        uint4 th[R], tl[R], tq[R];
-        {
-            const int blk = bp < n_blocks ? bp : n_blocks - 1;
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                const char * p = rowp[r] + size_t(blk) * sizeof(block_q5_K);
-                th[r] = __ldg(reinterpret_cast<const uint4 *>(p));
-                tl[r] = __ldg(reinterpret_cast<const uint4 *>(p + qs_off));
-                tq[r] = __ldg(reinterpret_cast<const uint4 *>(p + qh_off));
-            }
-        }
         for (int ip = 0; ip < n_pairs; ++ip) {
             const int ib = 2 * ip + bp;
             const bool valid = ib < n_blocks;
-            const int nblk = 2 * (ip + 1 < n_pairs ? ip + 1 : ip) + bp;
-            const int nb = nblk < n_blocks ? nblk : n_blocks - 1;
-            uint4 nh[R], nl[R], nq[R];
+            const int nb = valid ? ib : n_blocks - 1;
+            uint4 th[R], tl[R], tq[R];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const char * p = rowp[r] + size_t(nb) * sizeof(block_q5_K);
-                nh[r] = __ldg(reinterpret_cast<const uint4 *>(p));
-                nl[r] = __ldg(reinterpret_cast<const uint4 *>(p + qs_off));
-                nq[r] = __ldg(reinterpret_cast<const uint4 *>(p + qh_off));
+                th[r] = __ldg(reinterpret_cast<const uint4 *>(p));
+                tl[r] = __ldg(reinterpret_cast<const uint4 *>(p + qs_off));
+                tq[r] = __ldg(reinterpret_cast<const uint4 *>(p + qh_off));
             }
             const int cb = valid ? ib : n_blocks - 1;
             const int g = 8 * cb + group;
@@ -245,10 +233,6 @@ static __global__ __launch_bounds__(q5k_threads, (R == 4 ? 3 : 6)) void q5k_mmv(
                 const float2 p = __half22float2(__hadd2(pa, pb));
                 const float dot = (p.x + p.y) * rescale;
                 acc[r] += (d * sc) * dot - (dmin * mn) * sxh;
-            }
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                th[r] = nh[r]; tl[r] = nl[r]; tq[r] = nq[r];
             }
         }
 #pragma unroll
