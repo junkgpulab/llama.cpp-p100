@@ -311,13 +311,31 @@ struct ggml_cuda_gdn_gather {
     int64_t         row; // floats between cache rows
 };
 static thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_gdn_gather> gdn_gathers;
+static constexpr int64_t GDN_GATHER_INDEX_CAPACITY = 4096;
+static __device__ int32_t gdn_gather_indices[GDN_GATHER_INDEX_CAPACITY];
+static thread_local int64_t gdn_gather_index_cursor = 0;
 
 void ggml_cuda_gdn_gather_reset() {
     gdn_gathers.clear();
+    gdn_gather_index_cursor = 0;
 }
 
-void ggml_cuda_gdn_gather_register(const ggml_tensor * gdn, const float * base, const int32_t * idx, int64_t row) {
-    gdn_gathers[gdn] = { base, idx, row };
+bool ggml_cuda_gdn_gather_register(const ggml_tensor * gdn, const float * base, const int32_t * idx, int64_t row,
+                                   int64_t n, cudaStream_t stream) {
+    if (n > GDN_GATHER_INDEX_CAPACITY - gdn_gather_index_cursor) {
+        return false;
+    }
+    static thread_local void * device_ptrs[GGML_CUDA_MAX_DEVICES] = {};
+    const int device = ggml_cuda_get_device();
+    if (device_ptrs[device] == nullptr) {
+        CUDA_CHECK(cudaGetSymbolAddress(&device_ptrs[device], gdn_gather_indices));
+    }
+    int32_t * dst_slot = (int32_t *) device_ptrs[device] + gdn_gather_index_cursor;
+    // The allocator may reuse src[1] before the consumer reads its indices.
+    CUDA_CHECK(cudaMemcpyAsync(dst_slot, idx, n * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+    gdn_gather_index_cursor += n;
+    gdn_gathers[gdn] = { base, dst_slot, row };
+    return true;
 }
 
 bool ggml_cuda_gdn_gather_lookup(const ggml_tensor * consumer, const float ** base, const int32_t ** idx, int64_t * row) {

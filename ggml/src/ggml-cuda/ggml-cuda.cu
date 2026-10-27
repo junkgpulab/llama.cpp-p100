@@ -4471,7 +4471,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // GET_ROWS that gathers recurrent states whose only consumer, through reshape views, is a gated delta
 // net's state input: skip it and let the kernel read the rows in place (gated_delta_net.cuh).
 // GGML_CUDA_GDN_GATHER=0 turns it off.
-static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
+static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i, cudaStream_t stream) {
     static const bool enabled = [] {
         const char * s = getenv("GGML_CUDA_GDN_GATHER");
         return !s || atoi(s) != 0;
@@ -4545,9 +4545,8 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
     if (gdn == nullptr) {
         return false;
     }
-    ggml_cuda_gdn_gather_register(gdn, (const float *) node->src[0]->data, (const int32_t *) node->src[1]->data,
-                                  node->src[0]->nb[1] / sizeof(float));
-    return true;
+    return ggml_cuda_gdn_gather_register(gdn, (const float *) node->src[0]->data, (const int32_t *) node->src[1]->data,
+                                         node->src[0]->nb[1] / sizeof(float), ggml_nelements(node->src[1]), stream);
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -5957,7 +5956,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 const bool known_no_fuse = fce_valid && fce->no_fuse[i];
 
-                if (!known_no_fuse && node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_gather(cgraph, i)) {
+                if (!known_no_fuse && node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_gather(cgraph, i, cuda_ctx->stream())) {
                     continue; // the gated delta net reads the rows in place
                 }
 
