@@ -1884,7 +1884,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
 bool llama_kv_cache::kq_mask_compact_static() const {
     static const bool on = [] { const char * e = getenv("LLAMA_KQ_MASK_COMPACT"); return !e || atoi(e) != 0; }();
-    return on && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && v_cells.size() == 1;
+    // the compact I32 mask is built and tested for the qwen35 graph only: on other archs (Flash-Next qwen4exp) it
+    // reaches ggml_fill in the QSA layers and aborts, so they keep the full mask
+    return on && model.arch == LLM_ARCH_QWEN35 && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && v_cells.size() == 1;
 }
 
 bool llama_kv_cache::kq_mask_prefix(const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn, int32_t * L) const {
