@@ -5,7 +5,7 @@ It carries, as patches, code from:
   contributors (git authors Kaden, Tyler/Keoian, kane/KaneQuah). Pascal (sm_60) matvec,
   flash-attention, fold-GEMM and gated-delta-net kernels, the fixed-width speculative verify,
   MTP draft handling and the tensor-parallel exchange. Ported from commits d327bf1f0..7461904d
-  (and the lab fix c3baedee9 on 9537805ba). Kernel design and tuning are theirs.
+  Kernel design and tuning are theirs.
 - shinbunbun/llama-cpp-p100-patches (MIT), patch 01 (vmad dp4a on sm_60), behind
   GGML_CUDA_P100_VMAD.
 - JonathanColetti: the DFlash2 draft head for Qwen3.8-27B used with --spec-type draft-dflash

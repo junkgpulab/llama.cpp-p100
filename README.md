@@ -1,3 +1,66 @@
+# llama.cpp-p100: llama.cpp tuned for NVIDIA Tesla P100 (sm_60)
+
+> **This is a fork.** Upstream llama.cpp's own README follows below the line.
+
+**What it is:** upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) (master `6050b467c`, b11887, 2026-10-25)
+plus the Pascal / sm_60 kernels from **[Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp)** (`p100-optimizations`)
+plus our fixes:
+
+- **Padded speculative-verify fix:** unused verify columns could hold garbage, `0 x NaN` then poisoned the recurrent
+  state and the model answered "4444..." from the second request on. Pad columns are now zeroed and scale-by-0 writes 0.
+- **GDN in-place gather fix:** the gated-delta-net kernel could read a row index whose buffer had already been reused
+  (Xid 13 on Qwen3.8-Flash-Next). The index now lives in a private device buffer.
+- **Compact KQ mask limited to the qwen35 arch**, so other hybrid graphs (Qwen3.8-Flash-Next) load.
+- Opt-in MoE / Flash-Next work: BF16 and K-quant P100 mat-vec kernels, pinned host experts
+  (`GGML_CUDA_REGISTER_HOST=1`), per-card MoE cache budget (`LLAMA_MOE_CACHE_MIB_DEV`). All off by default.
+- A one-line build preset for sm_60.
+
+The speed comes from Kmic-68 and co's kernels. Patch series and notes: [docs/P100.md](docs/P100.md).
+
+## Speed: it ties Kmic's fork, it does not beat it
+
+Measured by us on one box, 2026-10-27: 2x Tesla P100 16 GB (PCIe), power cap 175 W, tensor split (`-sm tensor`),
+P2P on, Qwen3.8-27B Q6_K, MTP speculative decoding with 4 drafts, p-min 0.2, plus one tuned draft setting (explained in our next video, link here when it is out).
+"Kmic" = Kmic-68's `p100-optimizations` tip plus our padded-verify fix, same box, same flags, same session.
+
+| test | this fork | Kmic's fork | reading |
+|---|---|---|---|
+| 22-prompt head-to-head, overall t/s | 45.2 | 45.4 / 45.9 (two arms) | tie: median per-prompt ratio 0.999, inside Kmic's own run-to-run drift (0.990) |
+| 11-question bench, prose / code / 30K-context t/s | 58.9 / 70.5 / 56.5 | 59.8 / 71.4 / 57.3 | ~1.5% behind |
+| DFlash draft entry at 30K context, t/s | 44.5 | 41.4 | +7%, from draft acceptance (upstream numerics), not a kernel win |
+
+Single box, few runs; treat differences under ~3% as noise. No numbers at 62K+ context are claimed for this build.
+
+## Build
+
+sm_60 **only**: a multi-arch build silently falls back to upstream's kernels.
+
+```bash
+cmake --preset p100                # CUDA on, CMAKE_CUDA_ARCHITECTURES=60, Release
+cmake --build --preset p100        # llama-server + llama-bench in build-p100/
+```
+
+## Recipe
+
+Settings, launch flags and the full story: **https://youtu.be/JvLUoJYUjDM**.
+Channel: **[Junk GPU Lab](https://www.youtube.com/@junkgpulab)**.
+
+## Credits
+
+- **llama.cpp / ggml** ([ggml-org](https://github.com/ggml-org/llama.cpp)), MIT, Copyright (c) 2023-2026 The ggml authors.
+  The `LICENSE` file is upstream's, unchanged.
+- **[Kmic-68](https://github.com/Kmic-68/llama.cpp) and co-authors (Kaden, Tyler / [Keoian](https://github.com/Keoian), kane)**, MIT:
+  the sm_60 mat-vec kernels, fold-GEMM prefill, Pascal flash-attention, gated-delta-net / recurrent / norm kernels,
+  compact KQ mask, fixed-width speculative verify, MTP draft vocab, server padded verify and checkpoints, tensor-parallel
+  P2P exchange. All kernel design and tuning are theirs.
+- **[shinbunbun](https://github.com/shinbunbun/llama-cpp-p100-patches)**, MIT: patch 01 (vmad dp4a), behind `-DGGML_CUDA_P100_VMAD` (off by default).
+- Thanks to **fallentree** and **qr0n** for the P100 community work (no code of theirs is in this repo).
+- No model weights are shipped here; see each model card for its licence.
+
+Full notice: [NOTICE.md](NOTICE.md).
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
