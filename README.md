@@ -35,10 +35,50 @@ Single box, few runs; treat differences under ~3% as noise. No numbers at 62K+ c
 
 sm_60 **only**: a multi-arch build silently falls back to upstream's kernels.
 
+**You need** (Linux x86_64; tested on Ubuntu 24.04):
+
+| what | version | why |
+|---|---|---|
+| NVIDIA driver | 580 series | the last driver branch that supports Pascal; 590+ drops the P100 |
+| CUDA toolkit | 12.x (tested 12.9) | **not 13.x**: CUDA 13 cannot compile for sm_60 |
+| CMake | 3.23 or newer (tested 3.28) | the build uses `CMakePresets.json` |
+| Ninja | any recent (tested 1.12) | the preset's generator |
+| gcc / g++ | up to 14 (tested 13.3) | host compiler for nvcc 12.x |
+| git | any | |
+
+On Ubuntu: `sudo apt install build-essential cmake ninja-build git`, then CUDA 12.x from NVIDIA
+(the `cuda-toolkit-12-9` package, or the runfile with the driver box unticked if you already have driver 580).
+Make sure `nvcc` is on your `PATH` and is 12.x:
+
 ```bash
-cmake --preset p100                # CUDA on, CMAKE_CUDA_ARCHITECTURES=60, Release
-cmake --build --preset p100        # llama-server + llama-bench in build-p100/
+export PATH=/usr/local/cuda-12.9/bin:$PATH   # adjust to where CUDA 12.x is installed
+nvcc --version                               # must say release 12.x
+nvidia-smi                                   # must show your P100(s) and driver 580.x
 ```
+
+Then:
+
+```bash
+git clone https://github.com/junkgpulab/llama.cpp-p100
+cd llama.cpp-p100
+cmake --preset p100                # CUDA on, CMAKE_CUDA_ARCHITECTURES=60, Release, Ninja
+cmake --build --preset p100        # llama-server + llama-bench in build-p100/bin/
+./build-p100/bin/llama-server --version
+```
+
+A full build takes about 15 minutes on a 6-core desktop CPU. nvcc prints
+"offline compilation for architectures prior to sm_75 will be removed" for every CUDA file: that is a notice, not an error.
+
+**If it fails:**
+- `CMake was unable to find a build program corresponding to "Ninja"`: install Ninja (`ninja-build`).
+- `No CMAKE_CUDA_COMPILER could be found`: `nvcc` is not on your `PATH`; add the CUDA 12.x `bin` directory, or pass
+  `-DCMAKE_CUDA_COMPILER=/path/to/cuda-12.x/bin/nvcc` to the first `cmake` command.
+- `Unsupported gpu architecture 'compute_60'`: that `nvcc` is CUDA 13; use CUDA 12.x.
+- Link errors at the very end (`libcudart.so.12 ... not found`, `undefined reference to cudaMemcpy` / `cuMemMap`):
+  the linker cannot find the CUDA libraries. Register them once:
+  `echo /usr/local/cuda-12.9/lib64 | sudo tee /etc/ld.so.conf.d/cuda-12.conf && sudo ldconfig`
+  (adjust the path), then run `cmake --build --preset p100` again. `libcuda.so.1` missing means the NVIDIA driver is not installed.
+- If you have several CUDA versions installed, put the 12.x one first on your `PATH`.
 
 ## Recipe
 
