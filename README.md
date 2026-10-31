@@ -19,7 +19,7 @@ The speed comes from Kmic-68 and co's kernels. Patch series and notes: [docs/P10
 
 ## Speed: it ties Kmic's fork, it does not beat it
 
-Measured by us on one box, 2026-10-27: 2x Tesla P100 16 GB (PCIe), power cap 175 W, tensor split (`-sm tensor`),
+Measured by us on one box, 2026-10-27: 2x Tesla P100 16 GB (PCIe), tensor split (`-sm tensor`),
 P2P on, Qwen3.8-27B Q6_K, MTP speculative decoding with 4 drafts, p-min 0.2, plus one tuned draft setting (explained in our next video, link here when it is out).
 "Kmic" = Kmic-68's `p100-optimizations` tip plus our padded-verify fix, same box, same flags, same session.
 
@@ -94,7 +94,7 @@ Channel: **[Junk GPU Lab](https://www.youtube.com/@junkgpulab)**.
   compact KQ mask, fixed-width speculative verify, MTP draft vocab, server padded verify and checkpoints, tensor-parallel
   P2P exchange. All kernel design and tuning are theirs.
 - **[shinbunbun](https://github.com/shinbunbun/llama-cpp-p100-patches)**, MIT: patch 01 (vmad dp4a), behind `-DGGML_CUDA_P100_VMAD` (off by default).
-- Thanks to **fallentree** and **qr0n** for the P100 community work (no code of theirs is in this repo).
+- Thanks to **fallentree** and **[qr0n](https://github.com/qr0n/p100-llama-cpp)** for the P100 community work (no code of theirs is in this repo).
 - No model weights are shipped here; see each model card for its licence.
 
 Full notice: [NOTICE.md](NOTICE.md).
