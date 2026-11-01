@@ -20,7 +20,7 @@ The speed comes from Kmic-68 and co's kernels. Patch series and notes: [docs/P10
 ## Speed: it ties Kmic's fork, it does not beat it
 
 Measured by us on one box, 2026-10-27: 2x Tesla P100 16 GB (PCIe), tensor split (`-sm tensor`),
-P2P on, Qwen3.8-27B Q6_K, MTP speculative decoding with 4 drafts, p-min 0.2, plus one tuned draft setting (explained in our next video, link here when it is out).
+P2P on, Qwen3.8-27B Q6_K, MTP speculative decoding with 4 drafts, p-min 0.2, plus one tuned draft setting (explained in [our second video](https://youtube.com/watch?v=oYLZFgduLDU)).
 "Kmic" = Kmic-68's `p100-optimizations` tip plus our padded-verify fix, same box, same flags, same session.
 
 | test | this fork | Kmic's fork | reading |
