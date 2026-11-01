@@ -20,7 +20,7 @@ The speed comes from Kmic-68 and co's kernels. Patch series and notes: [docs/P10
 ## Speed: it ties Kmic's fork, it does not beat it
 
 Measured by us on one box, 2026-10-27: 2x Tesla P100 16 GB (PCIe), tensor split (`-sm tensor`),
-P2P on, Qwen3.8-27B Q6_K, MTP speculative decoding with 4 drafts, p-min 0.2, plus one tuned draft setting (explained in [our second video](https://youtube.com/watch?v=oYLZFgduLDU)).
+P2P on, Qwen3.8-27B Q6_K, MTP speculative decoding with 4 drafts, p-min 0.2, plus one tuned draft setting, `LLAMA_SPEC_SAMPLE_TEMP=0` (greedy drafts; the draft guesser was sampling at 1.0), explained in [our second video](https://youtube.com/watch?v=oYLZFgduLDU).
 "Kmic" = Kmic-68's `p100-optimizations` tip plus our padded-verify fix, same box, same flags, same session.
 
 | test | this fork | Kmic's fork | reading |
@@ -82,7 +82,7 @@ A full build takes about 15 minutes on a 6-core desktop CPU. nvcc prints
 
 ## Recipe
 
-Settings, launch flags and the full story: **https://youtu.be/JvLUoJYUjDM**.
+Settings, launch flags and the full story: **https://youtu.be/JvLUoJYUjDM**. The greedy-draft setting `LLAMA_SPEC_SAMPLE_TEMP=0` (set it in the server's environment): **https://youtube.com/watch?v=oYLZFgduLDU**.
 Channel: **[Junk GPU Lab](https://www.youtube.com/@junkgpulab)**.
 
 ## Credits
